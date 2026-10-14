@@ -1,0 +1,1335 @@
+#+TITLE: SQLite / Node driver inventory — sqlite-cljs phase 1
+#+DATE: 2026-09-25
+#+STARTUP: overview
+#+OPTIONS: toc:3
+
+* About this document
+This is the verified inventory behind sqlite-cljs: which Node SQLite driver to wrap, what
+that driver's API really does, which SQLite DDL/DML grammar the data-driven DSL must
+render, which PRAGMAs a client library needs, and the exact DSL shapes phases 2–4
+implement. It is research only; implementation happens in later phases.
+
+*Product constraints that shape everything below (user directive):* ClojureScript-only
+API (no =^js= hints, no interop at call sites, all interop in ONE driver namespace);
+kebab-case keyword maps in and out; promesa promises for async operations; zero runtime
+npm dependencies beyond the wrapped driver; values are ALWAYS bound parameters and
+identifiers are ALWAYS quoted (SQL-injection safety is a hard rule).
+
+** Method and evidence tags
+- =[DOC sqlite]= — sqlite.org language reference and guides, fetched 2026-09-25 (page
+  list with "last updated" stamps in §10). Feature introduction versions come from
+  https://sqlite.org/changes.html.
+- =[DOC node]= — nodejs.org API docs: the v22.x line page (rendered as v22.23.3) and the
+  current page (rendered as v26.10.0).
+- =[DOC bs3]= — better-sqlite3 README, docs/api.md, docs/integer.md, docs/threads.md,
+  docs/performance.md, deps/defines.gypi and GitHub release notes for v13.0.0–v13.0.3.
+- =[DOC nsq3]= — node-sqlite3 (npm =sqlite3=) README and package.json.
+- =[DOC honeysql]= — honeysql 2.7.x README, getting-started, clause-reference,
+  special-syntax.
+- =[NPM]= — npm registry metadata and download counts (api.npmjs.org, week
+  2026-09-15..21).
+- =[LOCAL]= — observed on this machine on 2026-09-25: Node v22.23.2, npm 10.9.8, Linux
+  x86_64; better-sqlite3 12.11.1 then 13.0.3 installed into this repo; =node:sqlite= as
+  shipped with Node 22.23.2. Probe scripts live in the job tmp dir, not in the repo.
+Anything not covered by these tags is in §8 "Uncertainties".
+
+** Reading conventions
+- SQL keywords are upper case in rendered examples; identifiers are shown quoted exactly
+  as the library renders them (="user_name"=).
+- "Driver" means better-sqlite3 unless stated; "runner-up" means =node:sqlite=.
+- Versions: "SQLite ≥ 3.35.0" style gates matter because the driver bundles its own
+  SQLite (better-sqlite3 13.0.3 → SQLite 3.53.4; Node 22.23.2 =node:sqlite= → 3.51.3).
+
+* 0. Coverage checklist
+| # | Area                                                            | Status   | Section |
+|---+-----------------------------------------------------------------+----------+---------|
+| 1 | Driver choice (better-sqlite3 vs node:sqlite vs node-sqlite3), local build result | complete | 1 |
+| 2 | Driver API surface (chosen + runner-up), errors, sync truth, workers | complete | 2       |
+| 3 | SQLite DDL grammar census (tables, affinity, STRICT, constraints, indexes, views, triggers, ALTER, DROP) | complete | 3 |
+| 4 | PRAGMAs for a client library + introspection row shapes        | complete | 4       |
+| 5 | DML surface (INSERT/UPSERT/RETURNING/SELECT/UPDATE/DELETE), binding forms, value rules, quoting, limits | complete | 5 |
+| 6 | honeysql comparison, proposed DSL syntax, migrate! design       | complete | 6       |
+| 7 | Pitfalls and house positions                                    | complete | 7       |
+| 8 | Numbered uncertainties                                          | complete | 8       |
+| 9 | Phase 2/3 implementation outline (namespaces, public fns)       | complete | 9       |
+| 10 | Sources                                                        | complete | 10      |
+
+* 0b. Phase 2/3 implementation notes (2026-09-25, after implementation)
+The phases 2 and 3 code follows this document; where implementation contradicted or
+refined it, the section text below was corrected in place and the change is listed here.
+- *Namespaces* (§9): the planned =driver= + =core= pair is ONE namespace, =sqlite-cljs.core=
+  (task directive: exactly one driver-binding namespace). The execute layer is
+  =sqlite-cljs.query=; the DML renderer is =sqlite-cljs.dsl= (planned as =query=); =ddl= and
+  =migrate= as planned. No =^js= hints anywhere: driver properties are read with
+  =unchecked-get= and methods called with =js-invoke= (the phase-0 =util= precedent).
+- *Constructor is synchronous*: =(core/db path-or-opts)= returns the db value map (task
+  signature) — every operation on it returns a settled promesa promise.
+- *Column option spelling* (§6.3.1): canonical keys are =:primary-key? :not-null? :unique?
+  :autoincrement?=, =:references {:table :column :on-delete :on-update :deferrable}=,
+  =:generated-as {:expr :stored?}= (task deliverable spec, consistent with =:strict?=); the
+  bare spellings shown originally are accepted as aliases.
+- *Defaults*: =:if-not-exists?= defaults to TRUE for every CREATE and =:if-exists?= to TRUE
+  for every DROP (idempotent =migrate!=); the original text said false.
+- *DDL output*: =ddl/render= returns ={:statements ["sql" ...]}= (strings; DDL never has
+  parameters) instead of =[{:sql ..} ...]=.
+- *STRICT/type validation errors* are =:sqlite-cljs/argument-error= carrying =:column= (task
+  directive); malformed DSL forms remain =:sqlite-cljs/dsl-error= with =:form=.
+- *Nested =transact!= is rejected* (=:reason :nested-transaction=, task directive) instead of
+  becoming a SAVEPOINT (§2.5 describes the driver capability, unused).
+- *migrate!* (§6.4) is an idempotent "bring the database up to these definitions" apply
+  with drift detection and =user_version = (count defs)= as a fingerprint (task
+  directive), not the versioned up/down runner originally proposed.
+- *Reads*: =:coerce= per query implements uncertainty §8.4 option (b).
+- *Large IN lists* (§8.14): above 500 values =[:in x coll]= renders
+  =x IN (SELECT value FROM json_each(?))= with one JSON parameter; bulk inserts above 32766
+  parameters are chunked transparently by =query/execute!= in one transaction.
+- *DELETE/UPDATE grammar* (§5.5): with =ENABLE_UPDATE_DELETE_LIMIT=, =RETURNING= must come
+  BEFORE =ORDER BY ... LIMIT= (=[LOCAL]= the other order is a syntax error).
+- *readonly =:memory:=* (§2.1): the driver throws =TypeError "In-memory/temporary databases
+  cannot be readonly"= =[LOCAL]=; =core/db= raises config-error before calling it.
+- *Keywords as values*: in the DSL a keyword is always an identifier (dsl-error only when
+  a value is required and cannot be bound); in raw ={:sql :params}= / =[sql & params]=
+  calls a keyword parameter binds as its name (task directive).
+- *Select items*: a two-element vector is ALWAYS =[expr alias]= (honeysql rule); bare
+  function calls are wrapped =[[:lower :name]]= or written =[:as [:lower :name] :lname]=;
+  =[:count :*]= is the documented exception. Same rule for =:order-by= items
+  (=[[:lower :email] :asc]=).
+- *Index expressions* (§6.3.2) render without extra parentheses.
+
+* 1. Driver choice
+** 1.1 Candidate census
+| Candidate            | Version (2026-09-25) | Maintenance                                                        | Model                     | Node support                                   | Install                                                                                                     | Bundled SQLite                          | Downloads/week [NPM] |
+|----------------------+----------------------+--------------------------------------------------------------------+---------------------------+------------------------------------------------+-------------------------------------------------------------------------------------------------------------+-----------------------------------------+----------------------|
+| better-sqlite3       | 13.0.3 (2026-08-05)  | active (four releases Jul–Aug 2026) [DOC bs3 releases]             | synchronous               | =engines.node >= 22= [DOC bs3 package.json]     | N-API addon since 13.0.0; prebuilt binaries for darwin/linux/linuxmusl/win32 × x64/arm64 *shipped inside the npm package* (no download step, no prebuild-install); node-gyp fallback only for other platforms [DOC bs3 v13.0.0 notes][LOCAL] | 3.53.4 (v13.0.2 notes; =[LOCAL]= =sqlite_version()=) | 7,355,311 |
+| node:sqlite          | built into Node      | Node core; Stability 1.1 "Active development" on v22, 1.2 "Release candidate" on current (since v25.7.0) [DOC node] | synchronous (=DatabaseSync=, =StatementSync=) | v22.5.0+ (flag), v22.13.0+ unflagged [DOC node] | nothing to install                                                                                          | 3.51.3 on Node 22.23.2 =[LOCAL]=        | n/a |
+| node-sqlite3 (=sqlite3=) | 6.0.1 (2026-03-12) | *"DEPRECATED — This repository is currently unmaintained"* [DOC nsq3 README] | async, callbacks           | =>= 20.17.0=                                     | prebuild-install download (N-API), node-gyp fallback                                                        | 3.52.0 [DOC nsq3 README]                | 1,832,480 |
+| libsql (for orientation only) | —           | Turso's fork, different engine/API                                 | sync + async              | —                                              | —                                                                                                           | libSQL, not upstream SQLite             | 2,175,127 |
+
+** 1.2 node:sqlite status on Node v22.23.2 (the task's explicit question)
+- Added in v22.5.0 behind =--experimental-sqlite=; *"v22.13.0: SQLite is no longer behind
+  --experimental-sqlite but still experimental"*; the v22 page carries *Stability: 1.1 -
+  Active development* [DOC node v22].
+- The current docs (v26.10.0 page) say *"v25.7.0: SQLite is now a release candidate"*,
+  Stability 1.2. Node 22 never received the 1.2 promotion in its docs [DOC node current].
+- =[LOCAL]= on 22.23.2: =require("node:sqlite")= works *without any flag* but prints
+  =ExperimentalWarning: SQLite is an experimental feature and might change at any time=
+  on stderr for every process. Exports: =DatabaseSync, StatementSync, constants, backup=.
+- v22-line API gaps versus current Node (history tables): no =transaction= helper at all
+  (only the =isTransaction= property, v22.16.0); options/methods added late in the 22
+  line (=timeout= v22.16.0, =readBigInts/returnArrays= options v22.18.0, =columns()=
+  v22.16.0, =iterate()= v22.13.0). Nothing else in the v22 docs is missing for our needs.
+
+** 1.3 Local install / build result [LOCAL]
+| Step                                      | Result                                                                                                                                                   |
+|-------------------------------------------+----------------------------------------------------------------------------------------------------------------------------------------------------------|
+| =npm install= with =better-sqlite3 ^12.4.1= | resolved 12.11.1; =prebuild-install= downloaded =build/Release/better_sqlite3.node= (npm warned: "prebuild-install@7.1.3: No longer maintained"); no compiler run; SQLite 3.53.2; all probes passed |
+| bump to =^13.0.3= and reinstall            | 13.0.3; =node_modules/better-sqlite3/prebuilds/{darwin-arm64,darwin-x64,linux-arm64,linux-x64,linuxmusl-arm64,linuxmusl-x64,win32-arm64,win32-x64}.node= present in the package; no =build/= dir, no node-gyp, no network fetch beyond the tarball; only =node-addon-api= added to node_modules; SQLite 3.53.4 |
+| behaviour probe (≈90 checks, §2)           | all consistent with docs; differences from node:sqlite recorded in §2.9                                                                                   |
+| =node:sqlite= probe                         | loads unflagged, ExperimentalWarning, SQLite 3.51.3; =readBigInts= off → reading any integer > 2^53 throws =RangeError ERR_OUT_OF_RANGE= (§2.9)          |
+Java 21 + shadow-cljs 2.28.23 compile the scaffold; =./run-tests.sh= is green (7 tests / 74 assertions).
+
+** 1.4 Decision: better-sqlite3 13.x (runner-up node:sqlite; node-sqlite3 rejected)
+Justification, in order of weight:
+1. *Stability of the surface.* better-sqlite3 is a mature 13.x with a stable documented
+   API; =node:sqlite= on the Node line we run (22.x) is officially experimental (1.1),
+   prints a warning on every start, and its API grew feature by feature across 22.x
+   minors (§1.2). A library that pins Node 22 cannot promise the runner-up's behaviour.
+2. *Feature completeness for this library.* better-sqlite3 has the =transaction(fn)=
+   wrapper with savepoint nesting and deferred/immediate/exclusive variants (§2.5), a
+   =pragma()= helper, =pluck/raw/expand=, =safeIntegers= per statement, =backup=,
+   =serialize=, UDFs/aggregates/virtual tables; =node:sqlite= v22 has no transaction
+   helper and no pragma helper.
+3. *Install story.* 13.0.0 moved to N-API with prebuilds inside the package: on this
+   machine (Node 22.23.2, linux-x64) install was a pure tarball extraction, no toolchain
+   needed (§1.3). Eight platform/arch prebuilds cover the house targets.
+4. *Adoption.* 7.36 M downloads/week vs 1.83 M for the deprecated =sqlite3= [NPM].
+5. *node-sqlite3* is out: its own README declares it deprecated and unmaintained, and
+   its callback-era async API contradicts the driver's own guidance ("mutex thrashing";
+   [DOC bs3 README "Why should I use this instead of node-sqlite3"]).
+Risks accepted (tracked in §8): native addon (rebuild needed for Electron/unsupported
+platforms), SQLite version pinned by the driver's release cadence, engines =>= 22=.
+Runner-up plan: the driver namespace (§9.1) is the only place that knows the driver; a
+=node:sqlite= binding of the same ~20 functions is feasible later (differences in §2.9),
+which is why the surface deliberately avoids driver-specific extras (=expand=, virtual
+tables) in the public API.
+
+** 1.5 Async policy (house rule: promesa promises)
+better-sqlite3 is synchronous by design (its README argues this gives *better*
+concurrency for an embedded engine). The public =core= functions return promesa promises
+that are *already resolved/rejected* from the synchronous call — documented as such:
+they never yield to the event loop, exceptions become rejections, and =transact!= runs
+its body synchronously inside the driver's transaction wrapper (an async body would
+commit before its first =await=; [DOC bs3 api.md transaction caveats]). Genuinely async
+driver operations (=backup=) return the driver's promise wrapped in promesa. Long queries
+block the event loop; the documented escape is a worker thread (§2.7), out of scope.
+
+* 2. Driver API surface
+** 2.1 better-sqlite3 =Database= [DOC bs3 api.md][LOCAL 13.0.3]
+| Member                                     | Signature / behaviour                                                                                                                                                                   | Library mapping (§9)                       |
+|--------------------------------------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+--------------------------------------------|
+| =new Database(path, opts)=                 | path string; =":memory:"= in-memory; =""= or omitted → temporary; a =Buffer= from =serialize()= → in-memory copy. opts =readonly= (false), =fileMustExist= (false; ignored for memory/readonly), =timeout= ms busy timeout (5000), =verbose= fn(sql), =nativeBinding= path | =driver/open=; =core/open!= options         |
+| open failure                               | =[LOCAL]= missing directory → =TypeError "Cannot open database because the directory does not exist"= (not a SqliteError); =fileMustExist= → =SqliteError SQLITE_CANTOPEN=; write on =readonly= → =SqliteError SQLITE_READONLY=; =readonly= with =:memory:= → =TypeError "In-memory/temporary databases cannot be readonly"= | wrapped as config-error / sqlite-error; =core/db= rejects readonly+memory up front |
+| =.prepare(sql)= → =Statement=              | exactly one statement; =[LOCAL]= two statements → =RangeError "The supplied SQL string contains more than one statement"=; syntax error → =SqliteError SQLITE_ERROR near "x": syntax error=; unknown table → =SQLITE_ERROR no such table= | =driver/prepare= (+ cache)            |
+| =.transaction(fn)= → fn                    | §2.5                                                                                                                                                                                    | =driver/transaction*=                      |
+| =.pragma(str, {simple})= → rows or value   | e.g. =pragma("journal_mode = WAL", {simple:true})= → ="wal"=; =[LOCAL]= a setter without result rows returns =[]= (=user_version = 7=); =busy_timeout= row is ={timeout: n}=; "better to use this than prepared statements for PRAGMA" | =core/pragma!=                     |
+| =.explain(sql)= (13.0.0)                    | =EXPLAIN= / =EXPLAIN QUERY PLAN= without binding parameters                                                                                                                             | =core/explain!= (phase 3 optional)         |
+| =.backup(dest, {attached, progress})= → Promise | online backup in 100-page steps per event-loop cycle; restarts if another connection writes                                                                                       | =core/backup!=                             |
+| =.serialize({attached})= → Buffer          | whole database as bytes                                                                                                                                                                 | =core/serialize!=                          |
+| =.function(name, {deterministic, directOnly, varargs, safeIntegers}, fn)= | UDF; arity from =fn.length= unless varargs; same name+arity re-registers; =[LOCAL]= a throwing UDF surfaces as the thrown JS =Error= (not SqliteError)                              | =core/define-function!=                    |
+| =.aggregate(name, {start, step, inverse, result, ...})= | aggregate / window function                                                                                                                                                | =core/define-aggregate!=                   |
+| =.table(name, def-or-factory)=             | read-only virtual tables from generators                                                                                                                                                | not exposed (driver-specific)              |
+| =.loadExtension(path, entry)=              | needs extension compiled against a compatible SQLite                                                                                                                                    | =core/load-extension!= (phase 5 optional)  |
+| =.exec(sql)= → this                        | multiple statements, *no parameters* (=[LOCAL]= an unbound =?= is silently NULL), stops at the first error, "less safe"                                                                  | =core/exec!= for migration files only      |
+| =.close()= → this                          | after close =[LOCAL]= =prepare= → =TypeError "The database connection is not open"=; =open= → false                                                                                        | =core/close!=                              |
+| =.defaultSafeIntegers(bool)=, =.unsafeMode(bool)= | BigInt default for all statements (§2.3); unsafe mode disables safety checks (never used)                                                                                        | =core/open!= =:safe-integers?=              |
+| properties =open inTransaction name memory readonly= | =[LOCAL]= =:memory:= → =memory true=                                                                                                                                          | =core/open?= etc.                          |
+
+** 2.2 =Statement= [DOC bs3 api.md][LOCAL]
+| Member                     | Behaviour                                                                                                                                                                                                   |
+|----------------------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| =.run(...params)= → ={changes, lastInsertRowid}= | =changes= = rows inserted/updated/deleted by this statement (FK actions and triggers not counted); =lastInsertRowid= meaningful only after an INSERT into a rowid table; both JS numbers (BigInt with safeIntegers); =[LOCAL]= =run()= on a SELECT is allowed (changes 0) |
+| =.get(...)= → row or =undefined=            | first row; reader statements only                                                                                                                                                                    |
+| =.all(...)= → array                          | =[LOCAL]= =all()= on a non-reader → =TypeError "This statement does not return data. Use run() instead"=                                                                                             |
+| =.iterate(...)= → iterator                   | rows one by one; =busy= true while iterating; the statement cannot be re-run until the iterator is exhausted/closed                                                                                   |
+| =.pluck() .expand() .raw()=                  | mutually exclusive row shapes: first column only / namespaced by table ={t: {..}, $: {..}}= / arrays                                                                                                  |
+| =.columns()= → =[{name column table database type}]= | =[LOCAL]= expression columns have =column/table/database/type= null; call after execution when the schema may have changed                                                                    |
+| =.bind(...)= → this                          | permanent binding; =[LOCAL]= afterwards passing params → =TypeError "This statement already has bound parameters"=                                                                                   |
+| =.safeIntegers(bool)=                        | per-statement BigInt reads (§2.3)                                                                                                                                                                    |
+| =.toString()= (13.0.0)                       | expanded SQL for permanently bound params; =[LOCAL]= ="select 'it''s' as v"= — SQLite's own quoting                                                                                                  |
+| properties =database source reader readonly busy= | =[LOCAL]= =reader= true for SELECT and for INSERT ... RETURNING; =readonly= false for the RETURNING insert                                                                                   |
+| schema change after prepare                  | =[LOCAL]= a statement prepared before =ALTER TABLE ADD COLUMN= transparently re-prepares and returns the new column (SQLite's =sqlite3_prepare_v2= auto-recompile)                                   |
+
+** 2.3 Parameter binding forms and value conversion [DOC bs3 api.md "Binding Parameters"][DOC bs3 integer.md][LOCAL]
+| Form                            | better-sqlite3                                                                                                                                  |
+|---------------------------------+-------------------------------------------------------------------------------------------------------------------------------------------------|
+| =?= anonymous                   | positional args; arrays are flattened (=run(['a','b'])= ≡ =run('a','b')=); wrong count → =RangeError "Too few/many parameter values were provided"= |
+| =?NNN= numbered                 | documented nowhere in api.md; =[LOCAL]= =select ?2, ?1= with any argument shape → =RangeError Too many parameter values=. *Treat as unsupported.* |
+| =@name= / =:name= / =$name=     | one object argument with *bare* keys (=[LOCAL]= a key spelled =":a"= → =RangeError Missing named parameter "a"=); the three prefixes may be mixed in one statement; missing key → RangeError; =[LOCAL]= extra unknown keys are silently ignored |
+| mixing named + anonymous        | =run(45, {name: 'x'})= works                                                                                                                    |
+Value conversion (SQLite ↔ JS):
+| JS value                                | Bound as / read back                                                                                                                                                         |
+|-----------------------------------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| =null=                                  | NULL / =null=                                                                                                                                                                |
+| =undefined=                             | =[LOCAL]= binds as NULL (docs list only null)                                                                                                                                 |
+| number (any, integral or not)           | *always REAL* — =[LOCAL]= =typeof(?)= is ="real"= for =5=, =5.0=, =2^53=, =1e20=; source: =src/util/data.cpp= binds =IsNumber()= values as doubles and only =IsBigInt()= as int64. Affinity then converts REAL 5.0 to INTEGER in INTEGER/NUMERIC columns and in STRICT INTEGER columns (=[LOCAL]= 5.0 accepted, 5.5 → =SQLITE_CONSTRAINT_DATATYPE=), but a TEXT column stores ='5.0'= and an =ANY= column stores REAL 5.0 =[LOCAL]=. Read back: INTEGER → number (lossy above 2^53: =[LOCAL]= 9007199254740993 reads as 9007199254740992), REAL → number |
+| BigInt                                   | INTEGER; > 2^63−1 → =RangeError "The bound string, buffer, or bigint is too big"= =[LOCAL]=; read back as number unless =safeIntegers= (then BigInt)                          |
+| string                                   | TEXT (UTF-8, bound with an explicit byte length: =src/util/data.cpp= uses =utf8.length()=); =[LOCAL]= 1 MB string ok; a string containing =\u0000= round-trips intact but SQL string functions stop at the NUL (=length(?)= = 1 for ="a\u0000b"=; sqlite.org: results of expressions on strings with embedded NULs are undefined) |
+| =Buffer= / =Uint8Array=                   | BLOB; read back as =Buffer=                                                                                                                                                  |
+| boolean, =Date=, plain object, array-of-non-values | =TypeError "SQLite3 can only bind numbers, strings, bigints, buffers, and null"= (objects are interpreted as named-parameter maps: =[LOCAL]= ={a:1}= on a =?= statement → "Too few parameter values") |
+| =NaN=                                     | =[LOCAL]= NULL (=typeof= "null")                                                                                                                                             |
+| =Infinity= / =-Infinity=                  | =[LOCAL]= REAL Infinity, reads back as =Infinity=                                                                                                                             |
+| =-0=                                      | =[LOCAL]= reads back as 0                                                                                                                                                    |
+
+** 2.4 Errors [DOC bs3 api.md "class SqliteError"][DOC sqlite rescode][LOCAL]
+| Source                                   | Class / code                                                                                                                                    | Library envelope (=util=)                                        |
+|------------------------------------------+-------------------------------------------------------------------------------------------------------------------------------------------------+------------------------------------------------------------------|
+| any SQLite failure                       | =SqliteError= (subclass of Error, exported as =Database.SqliteError=) with =.code= = extended result code *string* (="SQLITE_CONSTRAINT_UNIQUE"=), =.message= from SQLite; unknown codes → ="UNKNOWN_SQLITE_ERROR_NNNN"= | =:sqlite-cljs/sqlite-error= with =:code :message :sql :cause=; =constraint-error?=, =busy-error?= |
+| binding problems                          | =RangeError= (count/missing named) or =TypeError= (unsupported type)                                                                            | =:sqlite-cljs/argument-error=                                    |
+| misuse (closed db, multi-statement, non-reader) | =TypeError= / =RangeError= with the messages in §2.1–2.2                                                                                  | =:sqlite-cljs/argument-error= (=:reason :closed= etc.)           |
+| open: missing directory                   | =TypeError=                                                                                                                                     | =:sqlite-cljs/config-error=                                      |
+| UDF throwing                              | the original JS error                                                                                                                           | passed through                                                   |
+Codes the library must recognise (all seen =[LOCAL]= unless noted; full lists: 31 primary,
+74 extended [DOC rescode]):
+| Code                                | When                                                                                                     |
+|-------------------------------------+----------------------------------------------------------------------------------------------------------|
+| =SQLITE_ERROR= (1)                  | syntax error, no such table/column, DQS literal, parameters in DDL expressions                           |
+| =SQLITE_BUSY= (5)                   | another connection holds the write lock past =busy_timeout= (=[LOCAL]= two connections, =BEGIN IMMEDIATE= twice, timeout 50 ms → =SQLITE_BUSY database is locked=); WAL-mode corner cases [DOC wal §9]; extended =SQLITE_BUSY_SNAPSHOT= (517), =SQLITE_BUSY_RECOVERY= (261), =SQLITE_BUSY_TIMEOUT= (773) |
+| =SQLITE_LOCKED= (6)                 | conflict within the same connection (shared cache / vtab) — rare with a single connection               |
+| =SQLITE_CONSTRAINT_*=              | =_PRIMARYKEY= (1555), =_UNIQUE= (2067), =_NOTNULL= (1299), =_CHECK= (275), =_FOREIGNKEY= (787), =_DATATYPE= (3091, STRICT), =_TRIGGER= (1811, RAISE), =_ROWID= (2579), =_FUNCTION= (1043), =_PINNED= (2835), =_COMMITHOOK= (531), =_VTAB= (2323) |
+| =SQLITE_MISMATCH= (20)              | non-integer into rowid / INTEGER PRIMARY KEY                                                             |
+| =SQLITE_READONLY= (8) + =_*=         | write on a readonly connection / directory / recovery                                                    |
+| =SQLITE_CANTOPEN= (14) + =_*=        | file cannot be opened (=fileMustExist=, permissions, =_ISDIR=, =_NOTEMPDIR=)                             |
+| =SQLITE_FULL= (13), =SQLITE_IOERR= (10) + 30 extended, =SQLITE_NOMEM= (7), =SQLITE_INTERRUPT= (9) | may auto-rollback the transaction [DOC lang_transaction §3]; check =inTransaction= after catching |
+| =SQLITE_CORRUPT= (11), =SQLITE_NOTADB= (26) | file damage / not a database                                                                     |
+| =SQLITE_SCHEMA= (17), =SQLITE_RANGE= (25), =SQLITE_TOOBIG= (18), =SQLITE_ABORT= (4)/=_ROLLBACK= (516), =SQLITE_AUTH= (23), =SQLITE_PERM= (3), =SQLITE_PROTOCOL= (15), =SQLITE_MISUSE= (21) | recognised, surfaced verbatim |
+
+** 2.5 Transactions [DOC bs3 api.md][DOC sqlite lang_transaction][LOCAL]
+- =db.transaction(fn)= returns a function that runs =fn= inside =BEGIN ... COMMIT=,
+  rolling back and rethrowing on any throw (=[LOCAL]= an insert that violates UNIQUE
+  inside the wrapper leaves the count unchanged). Variants =.deferred= (=BEGIN=, the
+  default), =.immediate=, =.exclusive=. Arguments and return value are forwarded.
+- Nested transaction functions become =SAVEPOINT=s; an inner throw rolls back to its
+  savepoint only (=[LOCAL]= outer insert survives an inner failure that the outer catches).
+- Rules: never mix manual BEGIN/COMMIT with the wrapper; async functions are wrong (commit
+  happens at the first =await=); after catching an error *inside* a transaction check
+  =db.inTransaction= — SQLite may have rolled back on its own (=ON CONFLICT ROLLBACK=,
+  =RAISE=, =SQLITE_FULL=, =SQLITE_BUSY=), and the recommended action is to rethrow.
+- SQLite semantics: =DEFERRED= starts as a read transaction and upgrades on the first
+  write (may then hit =SQLITE_BUSY= *mid-transaction*); =IMMEDIATE= takes the write lock at
+  =BEGIN= (fails fast with BUSY, the busy handler waits); =EXCLUSIVE= = IMMEDIATE in WAL.
+  House position (§7.6): =transact!= defaults to =:immediate=.
+- =COMMIT= itself can fail with =SQLITE_BUSY= when another reader is active (rollback
+  journal modes); in WAL a writer never waits for readers.
+
+** 2.6 User-defined functions, aggregates, extensions
+- =function= / =aggregate= (§2.1) receive JS numbers (BigInt with =safeIntegers: true=),
+  strings, Buffers, null; the return value must be a bindable value (undefined → NULL).
+  =directOnly: true= keeps them out of schema expressions (relevant to =trusted_schema=,
+  §4.1). =[LOCAL]= the name =nothing= is an SQLite keyword (=DO NOTHING=) — UDF names must
+  avoid keywords or be quoted.
+- Extensions: =loadExtension= exists; compatibility is the caller's problem. JSON is
+  built in (SQLite ≥ 3.38.0, =[LOCAL]= =json_extract=, =->>=, =json_group_array= work);
+  FTS5, R-Tree, math functions are compiled in (§2.8).
+
+** 2.7 Worker threads — out of scope, noted [DOC bs3 threads.md]
+better-sqlite3 supports one connection per worker thread (the doc's thread-pool example
+posts ={sql, parameters}= messages). Phase 2 uses the main thread only; a worker mode
+would be an additional entry point later (uncertainty §8.13).
+
+** 2.8 Compile options of the bundled SQLite (13.0.3) [DOC bs3 deps/defines.gypi][LOCAL pragma compile_options]
+| Option                              | Consequence for the library                                                                                         |
+|-------------------------------------+---------------------------------------------------------------------------------------------------------------------|
+| =SQLITE_DEFAULT_FOREIGN_KEYS=1=     | FK enforcement ON per connection by default (§3.7); the library still sets the pragma explicitly                    |
+| =SQLITE_DQS=0=                      | double-quoted strings are *never* string literals: ="dup"= → =SQLITE_ERROR no such column: "dup"= =[LOCAL]=. Exactly the strictness the identifier rule (§5.8) wants |
+| =SQLITE_DEFAULT_WAL_SYNCHRONOUS=1=  | WAL databases default to =synchronous=NORMAL= on a fresh connection (§4.1)                                          |
+| =SQLITE_ENABLE_UPDATE_DELETE_LIMIT= | =DELETE/UPDATE ... ORDER BY ... LIMIT= available (=[LOCAL]= works); *not* in node:sqlite's build (§2.9)             |
+| =SQLITE_ENABLE_FTS3/4/5=, =RTREE=, =GEOPOLY=, =JSON1=, =MATH_FUNCTIONS=, =PERCENTILE=, =STAT4=, =DBSTAT_VTAB=, =DESERIALIZE=, =COLUMN_METADATA= | available; =COLUMN_METADATA= is what makes =columns()= report origin table/column |
+| =SQLITE_LIKE_DOESNT_MATCH_BLOBS=, =SQLITE_SOUNDEX=, =SQLITE_OMIT_DEPRECATED/PROGRESS_CALLBACK/SHARED_CACHE/TCL_VARIABLE= | no shared cache (so =SQLITE_LOCKED_SHAREDCACHE= cannot occur)                        |
+| =SQLITE_THREADSAFE=2=, =SQLITE_USE_URI=0=, =SQLITE_DEFAULT_CACHE_SIZE=-16000=, =SQLITE_DEFAULT_MEMSTATUS=0=, =SQLITE_TRACE_SIZE_LIMIT=32= | URI filenames (=file:...?mode=ro=) are OFF — open options must be used instead |
+| =MAX_VARIABLE_NUMBER=32766= (SQLite default ≥ 3.32.0) | bound-parameter ceiling per statement (§5.9)                                                                |
+
+** 2.9 Runner-up: =node:sqlite= (Node 22.23.2) — differences that a second binding would have to absorb [DOC node v22][LOCAL]
+| Topic                    | node:sqlite                                                                                                                                                                                       |
+|--------------------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| classes                  | =DatabaseSync(path, {open, readOnly, enableForeignKeyConstraints (true), enableDoubleQuotedStringLiterals (false), allowExtension, timeout (0!), readBigInts, returnArrays, allowBareNamedParameters (true), allowUnknownNamedParameters (false)})=, =StatementSync=, =backup()= function, =constants= |
+| transactions             | *no helper*; only =isTransaction=; the library would issue =BEGIN/COMMIT/ROLLBACK/SAVEPOINT= itself                                                                                                |
+| pragma                   | no helper; =prepare("PRAGMA x").get()=                                                                                                                                                             |
+| rows                     | *null-prototype objects* (=[LOCAL]= =Object.getPrototypeOf(row) === null=) — =js->clj= leaves them untouched; =util/row->clj= uses =Object.keys= for this reason                                    |
+| integers                 | reading INTEGER outside ±2^53 *throws* =RangeError ERR_OUT_OF_RANGE= unless =setReadBigInts(true)= / =readBigInts= =[LOCAL]=; better-sqlite3 silently rounds                                        |
+| binding                  | JS numbers also bind as REAL (=[LOCAL]= =typeof(?)= "real" for 5; TEXT column stores '5.0'); boolean and =undefined= → =Provided value cannot be bound=; =Date= → NULL *silently* =[LOCAL]=; =NaN= → NULL; =Infinity= stays; TypedArray/DataView blobs; =?NNN= works (=[LOCAL]=); named keys may carry the prefix (=":x"=) or not |
+| errors                   | plain =Error= with =code: 'ERR_SQLITE_ERROR'=, =errcode= (numeric primary/extended), =errstr= (e.g. "SQL logic error") =[LOCAL]=; no string result-code names                                       |
+| busy timeout             | default 0 (no waiting) vs 5000                                                                                                                                                                     |
+| build                    | SQLite 3.51.3; =DEFAULT_WAL_SYNCHRONOUS=2=; no =ENABLE_UPDATE_DELETE_LIMIT=; =ENABLE_SESSION= (changesets); FTS5, R-Tree, math on; =THREADSAFE=1=                                                    |
+| stability                | experimental warning on every process start (§1.2)                                                                                                                                                 |
+
+* 3. SQLite DDL grammar census
+Everything in this section is from the sqlite.org language reference (=[DOC sqlite]=,
+pages listed in §10) unless tagged =[LOCAL]= (verified against better-sqlite3 13.0.3 /
+SQLite 3.53.4 on this machine). Version numbers are from https://sqlite.org/changes.html.
+The DSL (§6) must render exactly these shapes and nothing else.
+
+** 3.1 CREATE TABLE skeleton [DOC lang_createtable]
+#+begin_example
+CREATE [TEMP|TEMPORARY] TABLE [IF NOT EXISTS] [schema.]name
+  ( column-def [, column-def]* [, table-constraint]* )
+  [table-options]                       -- WITHOUT ROWID and/or STRICT, comma separated
+CREATE TABLE [IF NOT EXISTS] name AS select-stmt   -- no constraints, affinity from select
+#+end_example
+- =column-def ::= name [type-name] column-constraint*=
+- =type-name= is any sequence of identifiers optionally followed by =(n)= or =(n,m)=; the
+  numbers are ignored by SQLite (=VARCHAR(255)= is TEXT affinity, no length check)
+  [DOC datatype3 §3.1.1].
+- =CREATE TABLE ... AS SELECT= yields columns without PRIMARY KEY, UNIQUE, NOT NULL or
+  DEFAULT; declared types come from the expression affinity. The DSL should not offer
+  it as a schema primitive (it is a data-copy tool); a =:raw= migration step covers it.
+- The number of columns is bounded by =SQLITE_MAX_COLUMN= (2000 default, §5.9).
+
+** 3.2 Column types and type affinity [DOC datatype3]
+SQLite is *dynamically typed*: the declared type only sets the column's affinity (a
+preference), not a constraint, unless the table is STRICT (§3.3). Storage classes: NULL,
+INTEGER (1..8-byte signed), REAL (8-byte IEEE), TEXT, BLOB.
+
+| Rule | Declared type contains       | Affinity | Effect on inserted values                                                                 |
+|------+------------------------------+----------+-------------------------------------------------------------------------------------------|
+| 1    | "INT" (INT, INTEGER, BIGINT, INT8, UNSIGNED BIG INT ...) | INTEGER | text that is a well-formed number is converted (to INTEGER, else REAL); other text stays TEXT; REAL with integral value becomes INTEGER |
+| 2    | "CHAR", "CLOB", "TEXT"       | TEXT     | numbers are converted to their text form                                                  |
+| 3    | "BLOB" or *no type at all*   | BLOB     | nothing is coerced                                                                        |
+| 4    | "REAL", "FLOA", "DOUB"       | REAL     | like NUMERIC but integers are stored as floating point                                    |
+| 5    | anything else (NUMERIC, DECIMAL, BOOLEAN, DATE, DATETIME, ...) | NUMERIC | like INTEGER affinity (difference only visible in CAST) |
+
+Rules are tried in order: "CHARINT" is INTEGER (rule 1 wins). Verified locally: binding
+JS =5= into a TEXT column stores TEXT ='5'=; binding =5.0= into an INTEGER column stores
+INTEGER 5 (JS cannot distinguish 5 from 5.0, both bind as REAL, then affinity converts)
+=[LOCAL]=.
+
+Consequences for the DSL (house positions in §7):
+- =BOOLEAN= is *not* a storage class: booleans are integers 0/1; the =TRUE=/=FALSE=
+  keywords exist since 3.23.0 and are literals 1/0 [DOC datatype3 §2.1][DOC quirks §3.1].
+- No date/time storage class: TEXT ISO-8601 ("YYYY-MM-DD HH:MM:SS.SSS"), REAL Julian day
+  or INTEGER unix seconds are the three formats the built-in date functions understand
+  [DOC datatype3 §2.2]; =unixepoch()= exists since 3.38.0, the ='subsec'= modifier since
+  3.42.0 [DOC changes].
+- The DSL type vocabulary should therefore be exactly =:integer :real :text :blob :any=
+  (the STRICT set, §3.3) plus =:numeric= for non-strict tables, and it should render the
+  type name verbatim in upper case. Any other keyword type (=:boolean=, =:datetime=,
+  =:varchar=) should be rejected with a =:sqlite-cljs/dsl-error= rather than silently
+  mapped, because in a STRICT table it would fail at CREATE time and in a non-strict
+  table it silently becomes NUMERIC affinity (uncertainty §8.6 asks whether to allow a
+  =[:raw "VARCHAR(10)"]= escape).
+
+** 3.3 STRICT tables [DOC stricttables] (SQLite ≥ 3.37.0, 2021-11-27)
+- Append =STRICT= after the closing parenthesis. Every column must have a type and it
+  must be one of =INT INTEGER REAL TEXT BLOB ANY= (no other names, no =VARCHAR(n)=).
+- Values are coerced with the usual affinity rules; anything that cannot be converted
+  losslessly raises =SQLITE_CONSTRAINT_DATATYPE= (=[LOCAL]=: inserting text ='abc'= into a
+  STRICT INTEGER column → =SQLITE_CONSTRAINT_DATATYPE "cannot store TEXT value in INTEGER
+  column n.x"=; inserting =5.0= into a STRICT INTEGER column succeeds and stores INTEGER;
+  =5.5= is rejected).
+- =ANY= keeps the value exactly as inserted (no numeric coercion of numeric-looking text,
+  unlike =ANY= in a non-strict table).
+- PRIMARY KEY columns are implicitly NOT NULL; an =INTEGER PRIMARY KEY= is still the
+  rowid alias (an =INT PRIMARY KEY= is not).
+- =PRAGMA integrity_check= verifies STRICT column types.
+- A database containing a STRICT table cannot be opened by SQLite < 3.37.0 (unless
+  =PRAGMA writable_schema=ON=). Both candidate drivers bundle ≥ 3.51 (§1).
+- House position (§7.1): =:strict? true= is the *default* for tables created by the DSL;
+  callers opt out with =:strict? false=.
+
+** 3.4 Column constraints [DOC lang_createtable §3]
+| Constraint                          | Syntax rendered                                              | Notes                                                                                                                              |
+|-------------------------------------+--------------------------------------------------------------+------------------------------------------------------------------------------------------------------------------------------------|
+| PRIMARY KEY                         | =PRIMARY KEY [ASC|DESC] [conflict-clause] [AUTOINCREMENT]=   | at most one per table; =INTEGER PRIMARY KEY= = rowid alias (§3.6); =INTEGER PRIMARY KEY DESC= is *not* an alias (documented bug)   |
+| NOT NULL                            | =NOT NULL [conflict-clause]=                                 | column-level only (no table-level NOT NULL)                                                                                         |
+| UNIQUE                              | =UNIQUE [conflict-clause]=                                   | implemented as a unique index; NULLs are all distinct                                                                              |
+| CHECK                               | =CHECK (expr)=                                               | expr may not contain a subquery; result cast to NUMERIC, 0 → violation, NULL → passes; conflict algorithm always ABORT             |
+| DEFAULT                             | =DEFAULT literal | DEFAULT (expr) | DEFAULT CURRENT_TIME/CURRENT_DATE/CURRENT_TIMESTAMP= | the expr must be constant: no subqueries, column refs, *bound parameters* or double-quoted strings; =[LOCAL]=: =DEFAULT ?= → =SQLITE_ERROR=; CURRENT_TIMESTAMP is UTC text "YYYY-MM-DD HH:MM:SS" |
+| COLLATE                             | =COLLATE name=                                               | built-ins BINARY (default), NOCASE (ASCII only), RTRIM                                                                              |
+| REFERENCES (foreign-key-clause)     | =REFERENCES parent(cols) [ON DELETE action] [ON UPDATE action] [MATCH x] [[NOT] DEFERRABLE [INITIALLY DEFERRED|IMMEDIATE]]= | §3.7                                                                                            |
+| GENERATED ALWAYS AS                 | =[GENERATED ALWAYS] AS (expr) [STORED|VIRTUAL]=              | §3.8                                                                                                                              |
+| CONSTRAINT name prefix              | =CONSTRAINT name <constraint>=                               | optional on every constraint                                                                                                       |
+=conflict-clause ::= ON CONFLICT ROLLBACK|ABORT|FAIL|IGNORE|REPLACE= (§3.15); not allowed on
+CHECK and FOREIGN KEY.
+
+** 3.5 Table constraints [DOC lang_createtable]
+| Constraint  | Syntax                                                                       | Notes                                                                      |
+|-------------+------------------------------------------------------------------------------+----------------------------------------------------------------------------|
+| PRIMARY KEY | =[CONSTRAINT n] PRIMARY KEY (col [ASC|DESC] [COLLATE c], ...) [conflict-clause]= | column names only, no expressions; =PRIMARY KEY(x DESC)= on a lone INTEGER column still makes it the rowid alias |
+| UNIQUE      | =[CONSTRAINT n] UNIQUE (cols) [conflict-clause]=                             | column names only (use CREATE UNIQUE INDEX for expressions)                 |
+| CHECK       | =[CONSTRAINT n] CHECK (expr)=                                                | same rules as column CHECK                                                 |
+| FOREIGN KEY | =[CONSTRAINT n] FOREIGN KEY (cols) foreign-key-clause=                       | composite keys must use this form                                          |
+
+** 3.6 rowid, INTEGER PRIMARY KEY, AUTOINCREMENT [DOC lang_createtable §5][DOC autoinc]
+- Every non-WITHOUT-ROWID table has a 64-bit signed =rowid= (aliases =oid=, =_rowid_=
+  unless a real column has that name).
+- A single-column PRIMARY KEY whose declared type is *exactly* =INTEGER= (any case) is an
+  alias for the rowid; =INT=, =BIGINT=, etc. are ordinary columns with a unique index.
+- The rowid alias must hold integers; inserting NULL auto-assigns (largest rowid + 1, or
+  random above 2^63-1 exhaustion → =SQLITE_FULL=); inserting a blob/text that is not a
+  lossless integer → "datatype mismatch" (=SQLITE_MISMATCH=).
+- =AUTOINCREMENT= (only valid on =INTEGER PRIMARY KEY=, never on WITHOUT ROWID tables)
+  changes the algorithm to "never reuse a rowid from a *committed* transaction", tracked
+  in =sqlite_sequence=. The sqlite.org summary: "imposes extra CPU, memory, disk space,
+  and disk I/O overhead and should be avoided if not strictly needed. It is usually not
+  needed." House position (§7.2): the DSL renders =AUTOINCREMENT= only when asked
+  (=:autoincrement true=) and the docstring repeats this warning.
+- =lastInsertRowid= (driver) is meaningless for WITHOUT ROWID tables (=[LOCAL]=: it
+  reports the unchanged previous rowid) — use =RETURNING= instead (§5.3).
+
+** 3.7 Foreign keys [DOC foreignkeys]
+- Declared per column (=REFERENCES parent(col)=) or per table (=FOREIGN KEY (a,b)
+  REFERENCES parent(x,y)=). The parent key must be named columns (never the rowid) and
+  must be a PRIMARY KEY or UNIQUE *constraint* of the parent (a UNIQUE index created by
+  CREATE INDEX also works but can be dropped silently — sqlite.org recommends
+  constraints).
+- Enforcement is a per-connection setting: =PRAGMA foreign_keys=ON=, default OFF in
+  stock SQLite (quirks §4). Both candidate drivers turn it ON: better-sqlite3 compiles
+  with =SQLITE_DEFAULT_FOREIGN_KEYS=1= (§2.8) and node:sqlite's
+  =enableForeignKeyConstraints= defaults to true (§2.9) — =[LOCAL]= both report
+  =foreign_keys = 1= on a fresh connection.
+- =PRAGMA foreign_keys= is a *no-op inside a transaction* [DOC pragma] (=[LOCAL]=:
+  toggling it inside BEGIN..COMMIT leaves it at 1). Migrations that need it off must
+  toggle it outside the transaction (§6.4).
+- Actions for =ON DELETE= / =ON UPDATE=: =NO ACTION= (default), =RESTRICT= (checked
+  immediately, even if deferred), =SET NULL=, =SET DEFAULT=, =CASCADE=.
+- Deferral: =DEFERRABLE INITIALLY DEFERRED= is the only spelling that makes a constraint
+  deferred (checked at COMMIT); all other combinations are immediate. =PRAGMA
+  defer_foreign_keys=ON= defers all constraints for the current transaction.
+- =MATCH= is parsed and ignored (always MATCH SIMPLE). A NULL child key never violates.
+- Violation code: =SQLITE_CONSTRAINT_FOREIGNKEY= (787).
+- DDL interplay (with enforcement ON): =ALTER TABLE ADD COLUMN ... REFERENCES= requires
+  DEFAULT NULL; =DROP TABLE= runs an implicit =DELETE= first (actions fire, violations
+  abort the drop); =RENAME TO= rewrites child REFERENCES (≥ 3.26.0 always).
+- =PRAGMA foreign_key_check [(table)]= lists violations (child table, rowid, parent,
+  fk id); =PRAGMA foreign_key_list(table)= lists declarations (=[LOCAL]= columns:
+  =id seq table from to on_update on_delete match=).
+- Child-key indexes are *not* created automatically; sqlite.org §3 recommends an index
+  on every child key. House position (§7.3): the DSL adds nothing automatically but
+  =ddl/lint= (§9) warns about un-indexed child keys.
+
+** 3.8 Generated columns [DOC gencol] (SQLite ≥ 3.31.0, 2020-01-22)
+- =col TYPE [GENERATED ALWAYS] AS (expr) [VIRTUAL|STORED]=; VIRTUAL (computed on read)
+  is the default; STORED is written to disk.
+- May have a type (affinity applied to the result), NOT NULL, CHECK, UNIQUE, FK
+  constraints and indexes (an index on a VIRTUAL column is an expression index).
+- May not: have a DEFAULT, be part of the PRIMARY KEY, use subqueries/aggregates/window
+  or non-deterministic functions, reference the rowid directly, depend on itself; every
+  table needs at least one non-generated column.
+- =ALTER TABLE ADD COLUMN= can add VIRTUAL but not STORED generated columns.
+- =PRAGMA table_xinfo= exposes them (=hidden= = 2 virtual, 3 stored); =table_info= omits
+  them.
+
+** 3.9 Table options
+| Option          | Since | Requirements / effects [DOC withoutrowid][DOC stricttables]                                                                                                     |
+|-----------------+-------+------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| =WITHOUT ROWID= | 3.8.2 | requires a PRIMARY KEY (else error); the PK is the clustered b-tree key; =INTEGER PRIMARY KEY= loses its rowid-alias meaning; AUTOINCREMENT is an error; PK columns are NOT NULL enforced; =last_insert_rowid()= unaffected by inserts; best when the PK is not a large blob/string ("less than ~1/20th of a page") |
+| =STRICT=        | 3.37.0| §3.3; both may be combined: =) WITHOUT ROWID, STRICT=                                                                                                            |
+
+** 3.10 CREATE INDEX [DOC lang_createindex]
+#+begin_example
+CREATE [UNIQUE] INDEX [IF NOT EXISTS] [schema.]name ON table
+  ( indexed-column [, ...] ) [WHERE expr]
+indexed-column ::= (column-name | expr) [COLLATE name] [ASC|DESC]
+#+end_example
+- UNIQUE: duplicates rejected (=SQLITE_CONSTRAINT_UNIQUE=); NULLs are all distinct.
+- Expression indexes (≥ 3.9.0): expressions may reference only columns of the indexed
+  table, no subqueries, only deterministic functions.
+- Partial index (=WHERE=): the expression may not contain bound parameters =[LOCAL]=
+  (=create index ... where x > ?= → =SQLITE_ERROR=), so the DSL renders index predicates in
+  inline-literal mode (§6.3.9).
+- =NULLS FIRST/LAST= is *not* supported in indexes (NULLs sort first in ASC).
+- =COLLATE= per indexed column; default is the column's collation from CREATE TABLE.
+- =DROP INDEX [IF EXISTS] name=.
+- Introspection: =PRAGMA index_list(table)= → =seq name unique origin(c|u|pk) partial=;
+  =PRAGMA index_xinfo(index)= → =seqno cid(-1 rowid, -2 expression) name desc coll key=
+  (=[LOCAL]= shapes confirmed).
+
+** 3.11 CREATE VIEW [DOC lang_createview]
+#+begin_example
+CREATE [TEMP] VIEW [IF NOT EXISTS] [schema.]name [(column-name, ...)] AS select-stmt
+DROP VIEW [IF EXISTS] name
+#+end_example
+- Read-only (INSTEAD OF triggers for writes). Column-name list (≥ 3.9.0) is recommended;
+  otherwise result columns should carry =AS= aliases because auto-generated names are
+  not part of the interface.
+- The defining SELECT cannot contain bound parameters =[LOCAL]= (=create view ... where
+  x = ?= → =SQLITE_ERROR "parameters prohibited in views"=), so the DSL renders the view's
+  =:as= query in inline-literal mode (§6.3.9).
+
+** 3.12 CREATE TRIGGER (minimal, for orientation) [DOC lang_createtrigger]
+#+begin_example
+CREATE [TEMP] TRIGGER [IF NOT EXISTS] name [BEFORE|AFTER|INSTEAD OF]
+  (DELETE | INSERT | UPDATE [OF col, ...]) ON table [FOR EACH ROW] [WHEN expr]
+  BEGIN stmt; [stmt;]* END
+#+end_example
+- Row triggers only; =NEW.col= / =OLD.col=; =RAISE(ABORT|FAIL|ROLLBACK|IGNORE, msg)=;
+  BEFORE is the default when neither keyword is given; unknown columns in =UPDATE OF=
+  are silently ignored; triggers are dropped with their table. =WITH= and =RETURNING= are
+  not allowed inside trigger bodies.
+- Scope: the DSL offers =:create-trigger= only as a thin wrapper whose body statements are
+  DSL maps rendered in inline-literal mode, or a =:raw= string. It is phase-3 optional
+  (uncertainty §8.7).
+
+** 3.13 ALTER TABLE [DOC lang_altertable]
+| Form                                   | Since  | Restrictions                                                                                                                                                                                                  |
+|----------------------------------------+--------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| =ALTER TABLE t RENAME TO new=          | old    | rewrites references in triggers/views (≥ 3.25.0) and FOREIGN KEY clauses (≥ 3.26.0 always; earlier only with foreign_keys=ON); same database only                                                             |
+| =ALTER TABLE t RENAME COLUMN a TO b=   | 3.25.0 | also rewrites indexes/triggers/views; fails if it would make a trigger/view ambiguous                                                                                                                         |
+| =ALTER TABLE t ADD COLUMN column-def=  | old    | appended last; no PRIMARY KEY / UNIQUE; DEFAULT may not be CURRENT_TIME/DATE/TIMESTAMP or a parenthesised expression; NOT NULL requires a non-NULL default; REFERENCES (with FK on) requires DEFAULT NULL; no STORED generated column; added CHECK / NOT NULL generated constraints are tested against existing rows (≥ 3.37.0) |
+| =ALTER TABLE t DROP COLUMN c=          | 3.35.0 | rewrites the table; fails if the column is (part of) a PRIMARY KEY, UNIQUE, indexed, named in a partial-index WHERE, a table CHECK, a foreign key, a generated column expression, a trigger or a view          |
+| =ALTER TABLE t ALTER c SET/DROP NOT NULL= | 3.53.0 (2026-04-09) | only NOT NULL can be altered; =[LOCAL]= works on better-sqlite3 13.0.3 (SQLite 3.53.4); node:sqlite on Node 22.23.2 bundles 3.51.3 → not available there (§8.1)                                     |
+| anything else (change type, drop PK, add constraint) | — | the documented 12-step table-rebuild procedure inside a transaction: create new table, copy, drop old, rename, recreate indexes/triggers/views, =PRAGMA foreign_key_check=; =PRAGMA foreign_keys=OFF= *before* the transaction |
+- ALTER TABLE only edits the schema text and re-parses it; RENAME/ADD COLUMN are O(1) in
+  table size, DROP COLUMN and constraint-tested ADD COLUMN are O(rows).
+- DDL is transactional: =[LOCAL]= =BEGIN; CREATE TABLE ...; ROLLBACK= leaves no table,
+  and the sqlite.org rebuild procedure itself runs inside BEGIN..COMMIT.
+
+** 3.14 DROP [DOC lang_droptable][DOC lang_dropindex][DOC lang_dropview]
+- =DROP TABLE [IF EXISTS] [schema.]name= — removes the table, its indexes and triggers;
+  with foreign keys ON it is an implicit DELETE first (FK actions fire, immediate
+  violations abort the drop, deferred ones surface at COMMIT).
+- =DROP INDEX [IF EXISTS] name=, =DROP VIEW [IF EXISTS] name=, =DROP TRIGGER [IF EXISTS] name=.
+- =IF EXISTS= makes the statement a no-op instead of =SQLITE_ERROR "no such table"=.
+
+** 3.15 Conflict resolution [DOC lang_conflict]
+| Algorithm  | Effect on the statement                                                                                    | Transaction                                     |
+|------------+------------------------------------------------------------------------------------------------------------+-------------------------------------------------|
+| ROLLBACK   | statement aborts with =SQLITE_CONSTRAINT=                                                                   | whole transaction rolled back                   |
+| ABORT      | statement aborts with =SQLITE_CONSTRAINT=, its own changes undone (*default*, SQL-standard behaviour)       | stays open, earlier statements preserved        |
+| FAIL       | statement aborts but rows already changed by it are kept                                                   | stays open                                      |
+| IGNORE     | offending row skipped, no error (uniqueness / NOT NULL / CHECK only; FK → ABORT)                           | stays open                                      |
+| REPLACE    | UNIQUE/PK violation: delete the pre-existing rows then insert/update; NOT NULL: substitute the DEFAULT (else ABORT); CHECK/FK → ABORT; delete triggers fire only with recursive_triggers; change counter not incremented | stays open |
+- Given per constraint in CREATE TABLE (=ON CONFLICT x=) or per statement (=INSERT OR x=,
+  =UPDATE OR x=); the statement-level =OR= overrides the schema-level clause.
+- =REPLACE INTO= is an alias of =INSERT OR REPLACE=; it *deletes* the old row (new rowid,
+  FK cascades, lost columns) — prefer UPSERT (§5.2) for "insert or update".
+
+* 4. PRAGMAs that matter for a client library [DOC pragma]
+All row shapes below were confirmed with better-sqlite3 13.0.3 =db.pragma(...)= =[LOCAL]=
+(row objects with these exact snake_case keys; =sqlite-cljs= returns them kebab-cased).
+
+** 4.1 Connection settings
+| PRAGMA                  | Values / default                                         | Library use                                                                                                                                                                                       |
+|-------------------------+----------------------------------------------------------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| =journal_mode=          | DELETE (default) TRUNCATE PERSIST MEMORY WAL OFF; returns the *resulting* mode (unchanged if it could not switch); =:memory:= databases answer =memory= and ignore WAL =[LOCAL]= | =core/open!= sets =journal_mode = WAL= for file databases by default (=:wal? true=) and *checks the returned string* (a network filesystem or read-only dir silently keeps =delete= — §7.9). WAL is persistent in the file. |
+| =synchronous=           | 0 OFF, 1 NORMAL, 2 FULL (default), 3 EXTRA               | better-sqlite3 compiles =SQLITE_DEFAULT_WAL_SYNCHRONOUS=1=: a WAL database opened by a *new* connection answers 1 (NORMAL) =[LOCAL]=, the same file under node:sqlite answers 2 =[LOCAL]=. NORMAL in WAL is durable across application crashes, may lose the last transactions on power loss. =core/open!= exposes =:synchronous= and does not override the driver default (§7.10). |
+| =foreign_keys=          | boolean; stock default OFF, *both drivers default ON* (§3.7) | =core/open!= sets it explicitly (=:foreign-keys? true= default) and never relies on the compile default; no-op inside a transaction.                                                             |
+| =busy_timeout=          | milliseconds; stock default 0; better-sqlite3 sets 5000 via its =timeout= option (=[LOCAL]= =timeout: 1234= → =busy_timeout= 1234), node:sqlite defaults to 0 | exposed as =:busy-timeout-ms= (default 5000). Query form returns a row =={timeout: n}== (column name is =timeout=, not =busy_timeout=) =[LOCAL]=. |
+| =defer_foreign_keys=    | boolean, reset at every COMMIT/ROLLBACK                  | =core/transact!= option =:defer-foreign-keys? true= issues it right after BEGIN.                                                                                                                  |
+| =trusted_schema=        | boolean, default ON; sqlite.org "all applications are encouraged to switch this setting off" | =core/open!= option =:trusted-schema? false= default false (only affects unaudited functions/vtabs in schema expressions; §8.10). |
+| =query_only=            | boolean                                                  | =core/open!= =:read-only? true= uses the driver's readonly open flag instead (real =SQLITE_READONLY= errors =[LOCAL]=).                                                                          |
+| =cache_size=, =mmap_size=, =temp_store=, =journal_size_limit=, =wal_autocheckpoint= (default 1000 pages, PASSIVE) | tuning | passthrough via =core/pragma!=; not set by default.                                                                                                                                              |
+
+** 4.2 Versioning and checks
+| PRAGMA                    | Shape                                                                                   | Library use                                                                                                   |
+|---------------------------+-----------------------------------------------------------------------------------------+---------------------------------------------------------------------------------------------------------------|
+| =user_version=            | 32-bit signed integer at header offset 60, "available to applications to use however they want", 0 on a new database =[LOCAL]=; set with =PRAGMA user_version = N= (returns no rows =[LOCAL]=) | the migration cursor (§6.4). Must be read/written inside the same transaction as the migration's DDL. |
+| =application_id=          | 32-bit integer at offset 68, for =file(1)=-style identification                         | optional =:application-id= on =migrate!= (uncertainty §8.8)                                                   |
+| =schema_version=          | read-only in practice (writing can corrupt); incremented by every schema change         | =migrate/status= reports it as a cheap "schema changed?" signal                                               |
+| =integrity_check [(N)]=   | rows of ={integrity_check: "ok"}= or error text; O(N log N); checks STRICT types         | =core/check!= (=:full= mode)                                                                                  |
+| =quick_check [(N)]=       | same, O(N), skips index-content verification                                            | =core/check!= default                                                                                         |
+| =foreign_key_check [(t)]= | rows =(table rowid parent fkid)=                                                        | =core/check!= includes it; =migrate!= runs it after a table rebuild step                                      |
+| =wal_checkpoint(PASSIVE|FULL|RESTART|TRUNCATE)= | row =(busy log checkpointed)=                                     | =core/checkpoint!= (WAL growth control, §7.9)                                                                 |
+| =optimize=                | run "before closing" per sqlite.org                                                     | =core/close!= option =:optimize? true= (default false; uncertainty §8.11)                                     |
+
+** 4.3 Introspection (shapes =[LOCAL]= 3.53.4)
+| PRAGMA                       | Row columns                                                                       | Notes                                                                                                          |
+|------------------------------+-----------------------------------------------------------------------------------+----------------------------------------------------------------------------------------------------------------|
+| =table_list [(t)]=           | =schema name type(table|view|shadow|virtual) ncol wr strict=                       | ≥ 3.37.0; =wr= 1 = WITHOUT ROWID, =strict= 1 = STRICT — the only way to read table options without parsing SQL |
+| =table_info(t)=              | =cid name type notnull dflt_value pk=                                             | =pk= is the 1-based position in a composite PK (0 = not PK); =dflt_value= is the *SQL text* of the default (e.g. ='x'=, =(unixepoch())=), NULL when none; generated/hidden columns omitted |
+| =table_xinfo(t)=             | table_info columns + =hidden= (0 normal, 1 vtab hidden, 2 VIRTUAL generated, 3 STORED generated) | preferred by =ddl/table-info=                                                                          |
+| =index_list(t)=              | =seq name unique origin(c|u|pk) partial=                                          | auto-indexes are named =sqlite_autoindex_<t>_<n>=                                                              |
+| =index_xinfo(i)=             | =seqno cid name desc coll key=                                                    | =cid= −1 rowid, −2 expression (=name= NULL); the expression text is only in =sqlite_master.sql=                |
+| =index_info(i)=              | key columns only (=seqno cid name=)                                               | superseded by index_xinfo                                                                                      |
+| =foreign_key_list(t)=        | =id seq table from to on_update on_delete match=                                   | =to= is NULL when the REFERENCES clause omitted the parent columns                                             |
+| =sqlite_master= (alias =sqlite_schema=) | =type name tbl_name rootpage sql=                                       | =sql= is the *original* CREATE text (case and whitespace preserved =[LOCAL]=); the only source for CHECK expressions, collations, conflict clauses and partial-index predicates |
+| =compile_options=            | one row per option                                                                | =core/driver-info= surfaces the ones in §2.8                                                                   |
+
+* 5. DML surface for the DSL
+** 5.1 INSERT [DOC lang_insert]
+#+begin_example
+[WITH ...] (INSERT | REPLACE | INSERT OR (ROLLBACK|ABORT|FAIL|IGNORE|REPLACE)) INTO [schema.]table [AS alias] [(cols)]
+  ( VALUES (expr, ...) [, (expr, ...)]* [upsert-clause]
+  | select-stmt [upsert-clause]
+  | DEFAULT VALUES )
+  [RETURNING ...]
+#+end_example
+- Multi-row =VALUES= is one statement; there is *no* =DEFAULT= keyword inside VALUES
+  (omitted columns get their default, so all rows must list the same columns — the DSL
+  enforces equal key sets, §6.3.5).
+- =INSERT ... SELECT= with an upsert clause needs a =WHERE= (even =WHERE true=) to avoid
+  the =ON= ambiguity; =DEFAULT VALUES= cannot take an upsert clause; the =AS alias= is
+  usable in the upsert's SET/WHERE.
+- Row count: one statement is limited only by =SQLITE_MAX_VARIABLE_NUMBER= (32766 bound
+  values, §5.9) — the DSL chunks =:values= into ≤ 32766/columns rows per statement
+  inside one transaction when asked (=core/insert-many!=, §8.14).
+
+** 5.2 UPSERT [DOC lang_upsert] (≥ 3.24.0; multiple clauses / target-less DO UPDATE ≥ 3.35.0)
+#+begin_example
+ON CONFLICT [( indexed-column, ... ) [WHERE expr]] DO ( NOTHING | UPDATE SET col = expr [, ...] [WHERE expr] )
+#+end_example
+- The conflict target names a UNIQUE/PRIMARY KEY constraint or unique index (partial
+  unique indexes need the matching =WHERE=); it may be omitted only on the *last* clause.
+- Only uniqueness constraints trigger it (not NOT NULL / CHECK / FK); the decision is per
+  row; the first matching clause wins.
+- In =DO UPDATE=, bare column names are the *existing* row, =excluded.col= is the row that
+  would have been inserted; the trailing =WHERE= turns the update into a no-op.
+- The DO UPDATE runs as =OR ABORT= regardless of any other conflict clause; virtual tables
+  unsupported.
+- =[LOCAL]= =INSERT ... ON CONFLICT(a) DO UPDATE SET b = excluded.b RETURNING a, b= returns
+  the updated row.
+
+** 5.3 RETURNING [DOC lang_returning] (≥ 3.35.0)
+- =RETURNING expr [AS alias], ... | *= on top-level INSERT/UPDATE/DELETE (not inside
+  triggers, not as a subquery/CTE source).
+- INSERT/UPDATE see post-change values, DELETE pre-delete values; rows *directly*
+  modified only (no FK-action/trigger side effects); an UPSERT reports inserted *and*
+  updated rows.
+- Output order is arbitrary and unrelated to processing order; all changes happen on the
+  first step and the output is buffered in memory (large RETURNING sets cost RAM).
+- No aggregates/window functions at top level; only the target table may be referenced
+  (not =UPDATE FROM= auxiliaries); values are pre-AFTER-trigger.
+- Driver: a RETURNING statement is a =reader= (=[LOCAL]= =st.reader= true) → use
+  =all()/get()=, not =run()=; =lastInsertRowid= is unaffected for WITHOUT ROWID tables, so
+  =RETURNING= is the portable way to get generated keys.
+
+** 5.4 SELECT [DOC lang_select][DOC lang_with][DOC windowfunctions]
+| Piece              | SQLite specifics                                                                                                                                          |
+|--------------------+-----------------------------------------------------------------------------------------------------------------------------------------------------------|
+| result columns     | =expr [AS alias]=, =*=, =table.*=; aliases usable in ORDER BY/GROUP BY/HAVING                                                                             |
+| FROM               | tables, subqueries, =table-valued functions= (=json_each=, =json_tree=), comma joins                                                                      |
+| JOIN               | =[NATURAL] [LEFT|RIGHT|FULL] [OUTER] | INNER | CROSS JOIN= with =ON= / =USING=; RIGHT/FULL since 3.39.0 (=[LOCAL]= works); ON/USING may be omitted (becomes unconstrained) — the DSL always requires one except for CROSS |
+| WHERE / GROUP BY / HAVING | bare columns allowed in aggregate queries (quirks §6) — the DSL does not check         |
+| window functions   | =fn(args) [FILTER (WHERE ..)] OVER (name | ([PARTITION BY ..] [ORDER BY ..] [frame]))=, =WINDOW name AS (...)=; 11 built-ins (=row_number rank dense_rank percent_rank cume_dist ntile lag lead first_value last_value nth_value=) + any aggregate; since 3.25.0 |
+| ORDER BY           | =expr [COLLATE c] [ASC|DESC] [NULLS FIRST|LAST]= (NULLS FIRST/LAST since 3.30.0, =[LOCAL]= works); NULLs sort first by default                             |
+| LIMIT / OFFSET     | expressions must be integers (bound parameters fine); negative LIMIT = no limit; the =LIMIT x, y= comma form is *offset first* — the DSL never emits it   |
+| compound           | =UNION | UNION ALL | INTERSECT | EXCEPT=; ORDER BY/LIMIT only at the end and apply to the whole compound                                                  |
+| WITH               | =WITH [RECURSIVE] name [(cols)] AS [NOT] MATERIALIZED (select), ...= at the top of SELECT/INSERT/UPDATE/DELETE (not inside triggers; not before later members of a compound); MATERIALIZED hints ≥ 3.35.0 |
+| VALUES             | =VALUES (..), (..)= is a select-stmt (usable in CTEs and compounds)                                                                                       |
+| operators of note  | =IS [NOT]=, =IS [NOT] DISTINCT FROM= (≥ 3.39.0), =LIKE= (case-insensitive ASCII), =GLOB= (case-sensitive), =REGEXP= (needs a UDF), =->= / =->>= JSON (≥ 3.38.0), =||= concat, =BETWEEN=, =IN (list | subquery)=, =EXISTS=, =CAST=, =CASE=, =COLLATE= |
+
+** 5.5 UPDATE / DELETE [DOC lang_update][DOC lang_delete]
+- =UPDATE [OR conflict] table [AS alias] SET col = expr | (c1, c2) = (expr...) [FROM ...] [WHERE ...] [RETURNING ...]=;
+  =UPDATE FROM= (≥ 3.33.0, PostgreSQL style; the target is not repeated in FROM; a
+  multi-match join picks an arbitrary row).
+- =DELETE FROM table [WHERE ...] [RETURNING ...]=; a WHERE-less DELETE uses the truncate
+  optimisation (no row-level triggers/FK checks skipped, only speed).
+- =ORDER BY ... LIMIT ... [OFFSET]= on UPDATE/DELETE only with
+  =SQLITE_ENABLE_UPDATE_DELETE_LIMIT= (better-sqlite3 yes, node:sqlite no); ORDER BY only
+  selects which rows fall inside the LIMIT, not the deletion order or RETURNING order.
+  =[LOCAL]= the clause order is =... WHERE .. RETURNING .. ORDER BY .. LIMIT ..=: putting
+  RETURNING after LIMIT is a syntax error. The renderer emits that order.
+
+** 5.6 Parameter binding forms (SQLite side) [DOC lang_expr §4][DOC c3ref bind_blob]
+| Form    | SQLite meaning                                                                                                              | Driver support                                                         |
+|---------+-----------------------------------------------------------------------------------------------------------------------------+------------------------------------------------------------------------|
+| =?=     | next index (largest so far + 1); "discouraged" by sqlite.org because miscounting is easy — irrelevant for a renderer that emits them | both drivers                                                     |
+| =?NNN=  | explicit index NNN ≤ =SQLITE_MAX_VARIABLE_NUMBER=; the same NNN may repeat                                                  | node:sqlite yes; better-sqlite3 *no* (§2.3)                            |
+| =:AAAA= =@AAAA= =$AAAA= | named; also numbered (next index); =$= form allows Tcl-style =::= and =(...)= suffixes                              | both; better-sqlite3 keys are bare names                               |
+| unbound | a parameter that is never bound reads as NULL                                                                               | better-sqlite3 throws on count mismatch; =exec= cannot bind at all     |
+House position (§7.7): the renderer emits only anonymous =?= in left-to-right order and
+returns =:params= as a vector; named parameters are not part of the DSL (no name-collision
+rules to explain, works on both drivers).
+
+** 5.7 Value binding rules: CLJS value → driver value → SQLite storage
+| CLJS value                                  | =driver/->param= result                | SQLite type / note                                                                                                               |
+|---------------------------------------------+----------------------------------------+----------------------------------------------------------------------------------------------------------------------------------|
+| =nil=                                       | =null=                                 | NULL                                                                                                                             |
+| integer number (=(integer? x)=, safe, i.e. ≤ 2^53−1 in magnitude) | =js/BigInt x=            | INTEGER — because a JS number would bind as REAL (§2.3) and land as ='5.0'= in TEXT columns / REAL in =ANY= columns              |
+| non-integer finite number                   | as is                                  | REAL                                                                                                                             |
+| number with magnitude > 2^53−1              | argument-error (=:reason :unsafe-integer=) | caller must pass a BigInt (exact) — silently binding a rounded double is the kind of bug this rule exists for                 |
+| =NaN=, =±Infinity=                          | argument-error                         | SQLite would store NULL / Infinity silently                                                                                      |
+| BigInt                                      | as is                                  | INTEGER (int64 range, else driver RangeError → argument-error)                                                                   |
+| string                                      | as is; NUL inside → argument-error     | TEXT                                                                                                                             |
+| =true= / =false=                            | =1n= / =0n=                            | INTEGER 1/0 (house position §7.1)                                                                                                |
+| Buffer / Uint8Array / ArrayBuffer view      | as is (ArrayBuffer wrapped)            | BLOB                                                                                                                             |
+| keyword                                     | *dsl-error in value position*          | keywords are identifiers; use a string for an enum-like value                                                                    |
+| js/Date                                     | argument-error (=:reason :date=)       | caller converts: =(.getTime d)= for epoch ms INTEGER (house default §7.4) or =(.toISOString d)= for TEXT                          |
+| vector / map / set / seq                    | dsl-error unless wrapped =[:param v]=; =[:param v]= → argument-error unless v is one of the bindable types above | a CLJS collection is never auto-serialised; JSON is the caller's job (=js/JSON.stringify= of =clj->js=), stored as TEXT |
+| JS object                                   | argument-error                         |                                                                                                                                  |
+Reading back (=util/row->clj=): keys kebab-cased, values untouched — INTEGER → number
+(BigInt when =:safe-integers? true=), REAL → number, TEXT → string, BLOB → Buffer, NULL →
+nil. Booleans and dates are *not* reconstructed (no schema knowledge at read time; §8.4).
+
+** 5.8 Identifier quoting rules [DOC lang_keywords][DOC quirks §8-9][DOC bs3 SQLITE_DQS=0]
+- SQLite accepts ="x"= (standard), =[x]= (MS), =`x`= (MySQL) as identifier quotes; the
+  library uses *only* double quotes. Inside, a double quote is written as two (="a""b"=)
+  — the same rule as single quotes in string literals.
+- With the driver's =SQLITE_DQS=0= a double-quoted token that is not an identifier is an
+  error instead of a string literal (§2.8), so a mistyped column name fails loudly.
+- Any keyword becomes a legal name once quoted (="select"=); SQLite also lets many
+  keywords be bare identifiers, but the library never relies on that (147 keywords, list
+  grows).
+- Names are case-insensitive for matching but case-preserving in the schema (=CREATE
+  TABLE "Users"= can later be referenced as =users=); kebab keywords always render lower
+  snake_case; string identifiers are passed through exactly (=util/ident-name=).
+- Schema-qualified names (=main.t=, =temp.t=, attached =aux.t=) quote each part.
+- A NUL byte inside an identifier is rejected before rendering (=util/ident-name=): the C
+  string SQLite receives would be truncated, which is an injection vector.
+- Function names in =[:fn ...]= forms are rendered unquoted (SQLite function names are
+  never quoted) and therefore restricted to =[a-z_][a-z0-9_]*= (§6.3.7).
+
+** 5.9 Limits that shape the renderer [DOC limits][LOCAL compile options]
+| Limit                          | Default                                     | Renderer consequence                                        |
+|--------------------------------+---------------------------------------------+-------------------------------------------------------------|
+| =SQLITE_MAX_VARIABLE_NUMBER=   | 32766 (≥ 3.32.0; 999 before)                | chunk multi-row inserts (§5.1); =[:in x coll]= with > 32766 values must use a temp table / json_each (§8.14) |
+| =SQLITE_MAX_COLUMN=            | 2000                                        | columns per table / SELECT / index                          |
+| =SQLITE_MAX_SQL_LENGTH=        | 1,000,000,000 bytes                         | not a concern                                               |
+| =SQLITE_MAX_COMPOUND_SELECT=   | 500                                         | UNION members                                               |
+| =SQLITE_MAX_EXPR_DEPTH=        | 1000                                        | =[LOCAL]= a 32766-term =? + ? + ...= chain fails with "Expression tree is too large"; deeply nested =:and/:or= trees likewise — the renderer keeps n-ary =:and= flat |
+| =SQLITE_MAX_ATTACHED=          | 10                                          |                                                             |
+| =SQLITE_MAX_LENGTH=            | 1,000,000,000 bytes per string/blob         |                                                             |
+
+* 6. honeysql comparison and the sqlite-cljs DSL
+** 6.1 What honeysql gets right [DOC honeysql] (2.7.x, README/getting-started/clause-reference read 2026-09-25)
+- SQL statements are plain hash maps keyed by clause (=:select :from :where ...=), SQL
+  expressions are vectors with the operator/function first (=[:= :id 1]=,
+  =[:count :*]=). Everything composes with =assoc=/=merge=/=update=; no builder objects.
+- Keywords/symbols are SQL entities, *strings are values* that become parameters. This
+  single rule is what makes the data safe: =[:= :name "x"]= → =name = ?= with ="x"= bound.
+- Namespaced keywords are table-qualified columns (=:users/id= → =users.id=), aliases are
+  pairs (=[:name :item]=, =[[:users :u]]=), =:order-by= takes =[expr :desc]= pairs,
+  =:where= nests =[:and ...]= / =[:or ...]=, =nil= renders =IS NULL=.
+- =format= returns =["SQL" param ...]=; =:params= + =:?name= / =[:param :x]= give named
+  parameters; =:inline true= exists for copy/paste use only.
+- Identifier quoting is off by default and only "unusual" entities are auto-quoted (since
+  2.3.928); the docs say "if the table, column, or function names could be provided by
+  an external source, you should specify =:quoted true=".
+- DDL: =:create-table= + =:with-columns= (vector of =[name type & descriptors]=,
+  everything inlined), =:alter-table= with =:add-column :drop-column :rename-column=,
+  =:create-index=, =:create-view=, =:drop-table=; =:on-conflict= / =:do-update-set= /
+  =:do-nothing= (PostgreSQL-style, so SQLite compatible), =:returning=,
+  =:replace-into= ("only supported by MySQL and SQLite"), =:with= CTEs, window clauses,
+  =:raw=, =:lift= (force a value), =:nest=.
+- Escape hatches are explicit: =[:raw "..."]= for literal SQL, =[:lift v]= to force a
+  value, =[:inline v]= to force a literal.
+
+** 6.2 Copy / drop table
+| honeysql behaviour                                       | sqlite-cljs decision                                                                                                          |
+|----------------------------------------------------------+-------------------------------------------------------------------------------------------------------------------------------|
+| maps = statements, vectors = expressions, keywords = entities, strings = values | *copy verbatim* — this is the whole design                                                             |
+| =:from [:users]= (vector) and =:from :users= both accepted | copy (accept keyword or vector; alias pairs)                                                                                  |
+| =[:= :x nil]= → =IS NULL=, =[:<> :x nil]= → =IS NOT NULL=  | copy                                                                                                                          |
+| =:where [:and ...]= / =[:or ...]= / =[:not ...]=, =[:in :x [1 2]]=, =[:between :x 1 2]=, =[:like ...]=, =[:exists {..}]= | copy; add =[:glob]=, =[:is]=, =[:is-not]=, =[:is-distinct-from]=, =[:->> ...]=, =[:collate expr :nocase]= |
+| alias pairs =[expr :alias]= inside =:select=              | copy                                                                                                                          |
+| namespaced keyword = table.column                        | copy (=:users/id=), also =:users.id=                                                                                          |
+| =format= → =["sql" & params]= vector                      | *drop*: render returns a kebab map ={:sql "..." :params [...]}= (house rule: maps in/out); no positional vector convention     |
+| quoting off / auto-quote "unusual" names                 | *drop*: every identifier is always quoted with ="..."= (§5.8); there is no unquoted mode                                      |
+| =:inline= (any value as literal)                          | *drop* for queries; DDL uses a restricted literal renderer internally (§6.3.9); user data can never be inlined                |
+| =:raw= (literal SQL fragment)                              | keep, with parameters: =[:raw "json_extract(data, '$.a') = ?" 42]= — the string is code, the extra elements are bound values   |
+| =:lift=                                                   | keep as =[:param v]= ("this value is data even though it is a vector/map") — needed to bind a Buffer/BigInt wrapped in a vector |
+| =:with-columns= as vectors of descriptors (=[:id :int [:not nil]]=) | *drop*: column defs are =[name type opts-map]= (§6.3.1) — a map of named options is readable and validatable; honeysql's positional descriptors leak dialect (=[:not nil]=, =:null=) |
+| =:create-table [:temp :fruit :if-not-exists]= keyword soup | *drop*: explicit =:if-not-exists true=, =:temp? true=, =:strict? true=, =:without-rowid? true=                                |
+| table options after =)= (STRICT, WITHOUT ROWID)          | not in the honeysql clause reference (=create-table= section shows none) — *add*                                              |
+| =:do-update-set :col= → =col = EXCLUDED.col=              | copy (=:do-update-set [:a :b]= and ={:a expr}= forms) and add =:where= on the DO UPDATE                                        |
+| =:on-conflict {:on-constraint :name}=                     | *drop* — SQLite has no named conflict targets; targets are column lists (+ optional =:where= for partial unique indexes)      |
+| dialects, =:quoted= option, =set-dialect!= global state   | *drop* — one dialect, no global mutable options                                                                               |
+| =:fetch=, =:offset= without limit, =:for update=, =:lock=, =:truncate=, =:select-top= | *drop* (not SQLite)                                                                                                |
+| helpers namespace (=(-> (select ..) (from ..))=)          | *drop* (phase 3 may add =query/select=-style helpers later; data first)                                                        |
+| numbered params =$1= option                               | *drop* (better-sqlite3 rejects =?NNN=, §5.6)                                                                                  |
+
+** 6.3 Proposed DSL syntax (exact shapes; the renderer implements these and rejects anything else with =:sqlite-cljs/dsl-error=)
+Conventions: keywords are identifiers and are rendered kebab→snake and quoted
+(=:created-at= → ="created_at"=); strings in *expression positions* are values (bound);
+strings in *identifier positions* (table/column names) are exact names, quoted verbatim;
+=nil= is =NULL=; booleans are the integers 1/0 (§7.1); vectors starting with a keyword are
+operator/function calls; maps in expression positions are subqueries.
+
+*** 6.3.1 Table definition
+#+begin_src clojure
+{:create-table :users
+ :if-not-exists? true                      ; optional, DEFAULT TRUE (phase 3; idempotent migrate!)
+ :strict? true                             ; optional, DEFAULT TRUE (house position §7.1)
+ :without-rowid? false                     ; optional, default false; requires a primary key
+ :temp? false                              ; optional
+ :columns                                  ; VECTOR (ordered) of [name type opts?]
+ [[:id :integer {:primary-key? true}]                     ; INTEGER PRIMARY KEY (rowid alias)
+  [:email :text {:not-null? true :unique? true :collate :nocase}]
+  [:name :text {:not-null? true}]
+  [:age :integer {:check [:>= :age 0]}]
+  [:active :integer {:not-null? true :default true}]      ; DEFAULT 1 (booleans are 0/1)
+  [:org-id :integer {:references {:table :orgs :column :id :on-delete :cascade :on-update :restrict
+                                  :deferrable :initially-deferred}}]   ; or :deferrable true / false
+  [:created-at :integer {:not-null? true :default [:raw "(unixepoch('subsec') * 1000)"]}]
+  [:updated-at :text {:default :current-timestamp}]       ; allow-listed keyword literal
+  [:data :text {:default "{}"}]                           ; string literal → DEFAULT '{}'
+  [:label :text {:generated-as {:expr [:|| :name " <" :email ">"] :stored? true}}]  ; GENERATED ALWAYS AS (...) STORED
+  [:legacy :any {}]]
+ :primary-key [:a :b]                      ; optional composite PK (only when no column has :primary-key?)
+ :unique [[:org-id :email] [:name]]        ; optional table UNIQUE constraints
+ :check [[:or [:= :active 0] [:= :active 1]]]
+ :foreign-keys [{:columns [:org-id] :table :orgs :ref-columns [:id] :on-delete :cascade :name :fk-org}]
+ :constraints                              ; optional, the vector form (same constraints, with opts)
+ [[:unique [:name] {:on-conflict :ignore}]
+  [:check [:> :age 0] {:name :ck-age}]
+  [:foreign-key [:org-id] [:orgs :id] {:on-delete :cascade}]
+  [:primary-key [:a :b] {:name :pk-ab}]]
+ :indexes                                  ; optional; rendered as separate CREATE INDEX statements
+ [[:users-email-idx [:email] {:unique? true}]
+  [nil [:org-id [:created-at :desc]] {:where [:= :active 1]}]]}   ; nil name → users_org_id_created_at_idx
+#+end_src
+Column =opts= keys (all optional; canonical spelling, phase 3): =:primary-key? true|:asc|:desc=,
+=:autoincrement? true= (only with =:primary-key?= on =:integer=, never in WITHOUT ROWID;
+rendered only on request per §3.6), =:not-null? true=, =:unique? true=, =:check expr=,
+=:default literal|keyword|[:raw ..]|expr=, =:collate :binary|:nocase|:rtrim|"name"=,
+=:references {:table t :column c :on-delete a :on-update a :deferrable d}= (actions ∈
+=#{:no-action :restrict :set-null :set-default :cascade}=, deferrable ∈ =true|false|
+:initially-deferred|:initially-immediate=), =:generated-as {:expr e :stored? bool}=,
+=:on-conflict= (conflict clause for PK/NOT NULL/UNIQUE ∈ =#{:rollback :abort :fail :ignore
+:replace}=), =:name= (CONSTRAINT name). The bare spellings =:primary-key :not-null :unique
+:autoincrement=, =:references [table col]= with =:on-delete=/=:on-update= beside it, and
+=:generated expr= + =:stored= are accepted as aliases. Types: =:integer :int :real :text
+:blob :any= plus =:numeric= and =[:raw "VARCHAR(255)"]= only with =:strict? false= — anything
+else (=:boolean=, =:datetime=, =:varchar= ...) is an =:sqlite-cljs/argument-error= naming the
+=:column= (§3.2, task directive).
+
+Renders (with =:strict? true=) to:
+#+begin_example
+CREATE TABLE IF NOT EXISTS "users" (
+  "id" INTEGER PRIMARY KEY,
+  "email" TEXT NOT NULL UNIQUE COLLATE NOCASE,
+  ...
+  "org_id" INTEGER REFERENCES "orgs"("id") ON DELETE CASCADE ON UPDATE RESTRICT DEFERRABLE INITIALLY DEFERRED,
+  "created_at" INTEGER NOT NULL DEFAULT (unixepoch('subsec') * 1000),
+  "label" TEXT GENERATED ALWAYS AS ("name" || ' <' || "email" || '>') STORED,
+  UNIQUE ("org_id", "email"),
+  ...
+) STRICT
+#+end_example
+followed by =CREATE UNIQUE INDEX IF NOT EXISTS "users_email_idx" ON "users" ("email")= etc.
+=ddl/render= returns ={:statements ["CREATE TABLE ..." "CREATE UNIQUE INDEX ..."]}= (one SQL
+string per statement, never parameters) because =prepare= accepts one statement at a time
+(§2.2); =query/execute-all!= / =query/exec!= / =migrate!= run them in one transaction.
+
+*** 6.3.2 Indexes and views
+#+begin_src clojure
+{:create-index :users-org-created-idx     ; nil → users_org_id_created_at_idx
+ :on :users
+ :columns [:org-id [:created-at :desc] [[:lower :email] :asc [:collate :nocase]]]  ; column | [col :desc] | [expr flags..]
+ :unique? true :if-not-exists? true        ; :if-not-exists? defaults to true
+ :where [:= :active 1]}                    ; partial index; literal mode (no parameters allowed, §3.10)
+;; renders CREATE UNIQUE INDEX IF NOT EXISTS "users_org_created_idx" ON "users" ("org_id", "created_at" DESC, lower("email") COLLATE NOCASE ASC) WHERE "active" = 1
+
+{:create-view :active-users
+ :if-not-exists? true :temp? false
+ :columns [:id :name]                      ; recommended by sqlite.org (§3.11)
+ :as {:select [:id :name] :from :users :where [:= :active 1]}}   ; rendered in literal mode (§3.11)
+#+end_src
+
+*** 6.3.3 ALTER / DROP
+#+begin_src clojure
+{:alter-table :users :rename-to :people}
+{:alter-table :users :rename-column [:name :full-name]}
+{:alter-table :users :add-column [:nickname :text {:default "" :not-null true}]}   ; §3.13 restrictions validated pre-render
+{:alter-table :users :drop-column :legacy}
+{:alter-table :users :alter-column [:name :set-not-null]}     ; SQLite ≥ 3.53 only (§3.13), else dsl-error from the version check
+{:drop-table :users :if-exists? true}                         ; :if-exists? defaults to true
+{:drop-index :users-email-idx}
+{:drop-view :active-users}
+{:drop-trigger :users-audit}
+{:create-trigger :users-audit :on :users :timing :after :event [:update :of [:name]]
+ :for-each-row? true :when [:> :new/id 0]
+ :body ["UPDATE users SET updated_at = unixepoch() WHERE id = NEW.id"]}   ; raw strings (§8.7) or DSL maps in literal mode
+#+end_src
+One clause per =:alter-table= map (SQLite allows one action per statement). Version gates
+(=rename-column= 3.25, =drop-column= 3.35, =alter-column= 3.53) apply when =ddl/render= is
+given ={:sqlite-version ..}= (=migrate!= and =execute-all!= pass the connection's version).
+
+*** 6.3.4 SELECT
+#+begin_src clojure
+{:with [[:recent {:select [:id] :from :orders :where [:> :created-at 1700000000000]}]
+        [[:tree [:id :parent-id]] {:union-all [...]} {:recursive true}]]   ; optional CTEs
+ :select [:id :name [:email :contact] [[:count :*] :n] [[:lower :name] :lname] :o/name]   ; [x y] is ALWAYS x AS y; wrap bare calls [[:lower :name]] or use [:as expr :alias]
+ :distinct? true                                             ; optional
+ :from :users                                                ; or [:users :u] or [[:users :u] [:orgs :o]] or {:select ..} subquery with alias [{..} :sub]
+ :joins [[:left-join [:orgs :o] [:= :o/id :u/org-id]] [:cross-join :e]]   ; ordered form: [kind table condition?]
+ :join [[:orgs :o] [:= :o/id :u/org-id]]                    ; INNER JOIN; pairs [table cond] repeated (rendered after :joins)
+ :left-join [[:profiles :p] [:using :user-id]]               ; also :right-join :full-join (≥ 3.39), :cross-join
+ :where [:and [:= :active true]
+              [:in :id [1 2 3]]                              ; IN (?, ?, ?) — empty vector renders 0=1 (§7.8)
+              [:like :name "a%"]
+              [:is :deleted-at nil]                          ; same as [:= :deleted-at nil]
+              [:or [:> :age 18] [:exists {:select [1] :from :grants :where [:= :grants/user-id :users/id]}]]
+              [:raw "json_extract(data, '$.role') = ?" "admin"]]
+ :group-by [:org-id]
+ :having [:> [:count :*] 1]
+ :order-by [[:name :desc] :id [[:lower :email] :asc :nulls-last] [:x [:collate :nocase]]]   ; vector item = [expr & flags]
+ :limit 10 :offset 20}                                       ; bound as parameters; :offset requires :limit
+#+end_src
+Renders to =WITH ... SELECT "id", "name", "email" AS "contact", count(*) AS "n", lower("name") AS "lname", "o"."name" FROM "users" INNER JOIN "orgs" AS "o" ON "o"."id" = "u"."org_id" LEFT JOIN "profiles" AS "p" USING ("user_id") WHERE ("active" = ? AND "id" IN (?, ?, ?) AND ...) GROUP BY "org_id" HAVING count(*) > ? ORDER BY "name" DESC, "id", lower("email") ASC NULLS LAST LIMIT ? OFFSET ?= with =:params [1 1 2 3 "a%" 18 "admin" 1 10 20]=.
+
+Compound selects: ={:union [{..} {..}]}=, =:union-all=, =:intersect=, =:except= (+ outer
+=:order-by=/=:limit=).
+
+*** 6.3.5 INSERT and UPSERT
+#+begin_src clojure
+{:insert-into :users :values [{:name "a" :email "a@x"} {:name "b" :email "b@x"}]}
+;; all maps must have the same key set (else argument-error): SQLite VALUES has no DEFAULT keyword
+{:insert-into :users :columns [:name :email] :values [["a" "a@x"] ["b" "b@x"]]}
+{:insert-into :users :columns [:name] :select {:select [:name] :from :staging :where [:= 1 1]}}
+;; the renderer appends WHERE true to a parameter-less select when an upsert clause follows (parsing ambiguity, §5.2)
+{:insert-into :users :or :ignore :values [...]}                       ; INSERT OR IGNORE|REPLACE|ABORT|FAIL|ROLLBACK
+{:insert-into :users :default-values true}
+{:insert-into :users :values [{:email "a@x" :name "A" :count 1}]
+ :on-conflict [:email]                                               ; conflict target (column list); [] or omitted → no target
+ :do-update-set [:name]                                               ; SET "name" = excluded."name"
+ :where [:> :excluded/updated-at :users/updated-at]}                  ; optional DO UPDATE ... WHERE
+{:insert-into :users :values [{...}]
+ :on-conflict [:email] :do-update-set {:count [:+ :users/count 1] :name :excluded/name}}
+{:insert-into :users :values [{...}] :on-conflict [] :do-nothing true} ; ON CONFLICT DO NOTHING
+{:insert-into :users :values [{...}]
+ :on-conflict [[[:email] {:do-update-set [:name]}] [[] {:do-nothing true}]]}   ; multiple ON CONFLICT clauses: vector of [target clause-map] pairs (≥ 3.35); clause maps take :do-update-set / :do-nothing / :where (target predicate) / :update-where
+{:insert-into :users :values [{...}] :returning [:id :created-at]}    ; or :returning :*
+#+end_src
+=:on-conflict= may carry a partial-index predicate as a single pair:
+=:on-conflict [[:email] {:where [:= :active 1]}] :do-update-set [:name]= (the DO clause then
+comes from the top-level keys). Bulk =:values= above 32766 parameters are split by
+=dsl/render-chunked= and =query/execute!= runs the chunks in one transaction (§8.14).
+
+*** 6.3.6 UPDATE / DELETE
+#+begin_src clojure
+{:update :users :set {:name "x" :age [:+ :age 1] :updated-at [:raw "unixepoch('subsec')*1000"]}
+ :where [:= :id 42] :returning [:id :name]}
+{:update :users :or :ignore :set {...} :from [[:orgs :o]] :where [:= :o/id :users/org-id]}   ; UPDATE FROM (≥ 3.33)
+{:delete-from :users :where [:= :id 42] :returning :*}
+{:delete-from :users :where [:< :created-at 0] :order-by [:created-at] :limit 100}   ; only with ENABLE_UPDATE_DELETE_LIMIT (better-sqlite3 yes, node:sqlite no — §2.8)
+#+end_src
+A =:where=-less UPDATE/DELETE is a dsl-error unless =:all? true= is present (guard rail).
+
+*** 6.3.7 Expression grammar
+| Form                                                | Renders                                       | Notes                                                                    |
+|-----------------------------------------------------+-----------------------------------------------+--------------------------------------------------------------------------|
+| =:col=, =:t/col=, =:t.col=, ="Exact Name"=          | ="col"=, ="t"."col"=, ="Exact Name"=          | strings are identifiers ONLY in identifier positions (=:from=, column lists); inside expressions strings are values |
+| =42=, ="text"=, =true=, =nil=, BigInt, Buffer/Uint8Array | =?=                                        | bound; =true/false= → 1/0; js/Date → argument-error (§7.4)               |
+| =[:param v]=                                        | =?=                                           | force a vector/map to be a value (JSON string is the caller's job)       |
+| =[:= a b]= =[:<> a b]= =[:not= a b]= =[:< a b]= =[:<= ...]= =[:> ...]= =[:>= ...]= | binary            | =[:= a nil]= → =a IS NULL=, =[:<> a nil]= / =[:not= a nil]= → =a IS NOT NULL=; =[:is-null x]= / =[:not-null x]= unary forms |
+| =[:and ...]= =[:or ...]= =[:not x]=                  | parenthesised                                 | empty =:and= → =1=1= (true), empty =:or= → =0=1=                          |
+| =[:in x coll]=, =[:not-in x coll]=, =[:in x {select}]= | =x IN (?, ?)= / subquery                    | empty coll → =0=1= / =1=1=; > 500 values (=:in-json-threshold=) or =[:in x [:json-each coll]]= → =x IN (SELECT value FROM json_each(?))= with one JSON parameter |
+| =[:between x lo hi]=, =[:like x p]=, =[:glob x p]=, =[:not-like ...]= | ...                          | optional =[:like x p {:escape "\\"}]=                                    |
+| =[:is x y]= =[:is-not x y]= =[:is-distinct-from x y]= | ...                                         |                                                                          |
+| =[:+ ...]= =[:- ...]= =[:* ...]= =[:/ ...]= =[:% ...]= =[:|| ...]= =[:->> j p]= =[:-> j p]= | infix              | =:->>= / =:->= need SQLite ≥ 3.38                                        |
+| =[:count :*]=, =[:lower x]=, any =[:fn args...]=     | =fn(args)=                                    | function name rendered *unquoted, lower-case, [a-z0-9_] only* (dsl-error otherwise); =:*= only as the sole arg |
+| =[:distinct x]= inside aggregates                    | =count(DISTINCT x)=                           |                                                                          |
+| =[:cast x :integer]=                                 | =CAST(x AS INTEGER)=                          | type from the same vocabulary as §3.2                                   |
+| =[:case [c1 v1] [c2 v2] :else v]=                    | =CASE WHEN .. END=                            |                                                                          |
+| =[:collate x :nocase]=                               | =x COLLATE NOCASE=                            |                                                                          |
+| =[:exists {select}]=, =[:not-exists ..]=, ={select}= as a scalar | subquery                          |                                                                          |
+| =[:as expr :alias]=                                  | =expr AS "alias"=                              | unambiguous alias form for select lists                                  |
+| =[:over [:row-number] {:partition-by [..] :order-by [..]}]= | window function                       | minimal window support: the 11 built-ins + aggregates, no frame specs in phase 3 (§8.9) |
+| =[:raw "sql" & params]=                              | verbatim                                      | the ONLY way to emit unquoted SQL; documented as unsafe for user input   |
+
+*** 6.3.8 Render output and execution
+- =dsl/render= → ={:sql "..." :params [...]}= (params in ? order as ClojureScript values;
+  =core/->param= converts them at bind time). Pure, no I/O, fully unit-testable without a
+  database. =dsl/render-chunked= → vector of statements for bulk inserts.
+- =ddl/render= → ={:statements ["..." ...]}= (never any params, §6.3.9).
+- =query/query-all!= (rows), =query/query-one!= (first row or nil), =query/query-value!=
+  (first column), =query/execute!= (={:changes n :last-insert-rowid n}= or RETURNING rows),
+  =query/execute-all!=, =query/exec!=, =query/transact!= accept a DSL map, ={:sql .. :params ..}=,
+  =[sql & params]= or a plain SQL string (§9).
+
+*** 6.3.9 Literal mode (DDL only)
+CHECK, DEFAULT, generated-column expressions, partial-index predicates and view bodies
+cannot contain bound parameters (=[LOCAL]= §3.4, §3.10, §3.11). The renderer therefore has
+two modes: =:params= (queries; every value → =?=) and =:literal= (DDL; values inlined). In
+literal mode only these value shapes are accepted: integers and finite floats (rendered
+with =str=, no exponent for integers), strings (single-quoted with ='= doubled, NUL
+rejected), =nil= → =NULL=, booleans → =1=/=0=, and the allow-listed keywords
+=:current-time :current-date :current-timestamp :null :true :false=. Blobs, BigInt beyond
+2^53, Dates, NaN/Infinity and any other type are dsl-errors. DDL comes from source code,
+not from users, but the same escaping discipline applies.
+
+** 6.4 migrate! design (revised in phase 3: idempotent apply)
+The versioned up/down runner sketched in phase 1 was replaced (task directive) by an
+idempotent "bring the database up to these definitions" apply. The original proposal is
+kept at the end of this section for the record.
+#+begin_src clojure
+(migrate/migrate! db
+  [{:create-table :orgs ...}
+   {:create-table :users ... :indexes [...]}
+   {:create-index :users-email-idx :on :users :columns [:email] :unique? true}
+   {:create-view :user-emails :columns [:email] :as {:select [:email] :from :users}}
+   {:alter-table :users :add-column [:nickname :text {:default "" :not-null? true}]}]
+  {:allow-newer? false :log println})
+;; => {:created [:orgs :users :users-org-idx :users-email-idx :user-emails] :existing [] :altered [:users]
+;;     :dropped [] :user-version 5 :previous-user-version 0 :sqlite-version "3.53.4"}
+#+end_src
+Algorithm (implemented in =sqlite-cljs.migrate=):
+1. Validate: a vector of DDL definition maps that each render (=migrate/validate= is pure);
+   otherwise migration-error =:reason :invalid-defs=.
+2. Read =PRAGMA user_version=. If it is above =(count defs)= the code is older than the
+   database → migration-error =:reason :database-newer= unless =:allow-newer? true=.
+3. In ONE =BEGIN IMMEDIATE= transaction, for each def in order:
+   - =:create-table= — absent: create it and its =:indexes=; present: leave it, create its
+     indexes when absent.
+   - =:create-index= / =:create-view= / =:create-trigger= — create when absent (by name in
+     =sqlite_master=), else report =:existing=.
+   - =:alter-table= — apply only when its effect is not yet there (add-column when the
+     column is missing, rename-column / rename-to when the old name exists and the new one
+     does not, drop-column when the column exists, alter-column always); a =:rename-to= whose
+     source is absent is skipped (a fresh database creates the renamed table directly).
+   - =:drop-*= — apply when the object exists.
+   - a statement SQLite refuses → migration-error =:reason :statement-failed :index :def
+     :code :cause=.
+4. Verify: every =:create-table= def must now exist with all declared columns and declared
+   types (=PRAGMA table_xinfo=; extra columns are fine). Otherwise migration-error
+   =:reason :drift :table :missing :type-mismatch= — nothing is altered automatically.
+5. =PRAGMA user_version = (count defs)= (fingerprint, not a cursor), COMMIT, clear the
+   statement cache. Any throw rolls everything back (DDL is transactional, §3.13).
+Evolving a table: the table def describes the DESIRED shape, explicit =:alter-table= defs
+bring existing databases there, renames precede the renamed def (see the namespace
+docstring example). =migrate/status!= → ={:user-version :schema-version :tables :views
+:indexes :triggers}=.
+
+*** Original phase-1 proposal (not implemented; versioned up/down runner)
+#+begin_src clojure
+(migrate/migrate! db
+  [{:version 1 :name "init"
+    :up [{:create-table :orgs ...} {:create-table :users ...}]}
+   {:version 2 :name "users.nickname"
+    :up [{:alter-table :users :add-column [:nickname :text {}]}
+         "UPDATE users SET nickname = name"]                 ; raw SQL strings allowed
+    :down [{:alter-table :users :drop-column :nickname}]}]
+  {:target 2 :dry-run? false :log println})
+#+end_src
+Steps: validate versions (positive, increasing, gap-free); =current = user_version=; apply
+each pending migration in its own =BEGIN IMMEDIATE= and set =user_version= inside it; toggle
+=foreign_keys= outside transactions when a migration asks (§3.7); optional =:down= steps.
+=ddl/introspect= / =ddl/diff= / =ensure-schema!= from that sketch became the
+=table_xinfo=-based verification step above.
+
+* 7. Pitfalls and house positions
+Each item states the pitfall, the evidence, and the position sqlite-cljs takes.
+
+** 7.1 Booleans and STRICT by default
+Pitfall: no BOOLEAN storage class; =BOOLEAN= as a declared type is NUMERIC affinity in a
+non-strict table and *illegal* in a STRICT table (§3.2, §3.3). Position: booleans bind
+as INTEGER 1/0 (§5.7); the DSL type vocabulary has no =:boolean= (columns are
+=:integer= with an optional =:check [:in :col [0 1]]=); tables are =STRICT= by default so
+type mistakes fail at write time instead of hiding as text.
+
+** 7.2 AUTOINCREMENT
+Pitfall: cargo-culted from MySQL; sqlite.org says it should be avoided (§3.6). Position:
+=INTEGER PRIMARY KEY= (rowid alias) is the idiom; =:autoincrement true= is rendered only
+when asked and =ddl/lint= flags it.
+
+** 7.3 Foreign keys: enforcement and indexes
+Pitfall: stock SQLite does not enforce FKs; both drivers do, but the setting is
+per-connection and a no-op inside transactions; child keys are not indexed
+automatically (§3.7). Position: =core/open!= sets =PRAGMA foreign_keys=ON= explicitly;
+=migrate!= toggles it only outside transactions; =ddl/lint= warns on un-indexed child
+keys.
+
+** 7.4 Dates
+Pitfall: no DATETIME class; =js/Date= binds as NULL silently in node:sqlite and throws in
+better-sqlite3 (§2.3, §2.9). Position: the library refuses =js/Date= (argument-error) and
+recommends *INTEGER epoch milliseconds* as the house default (sortable, cheap, exact,
+what =js/Date= natively holds) with =[:raw "(unixepoch('subsec') * 1000)"]= as the DEFAULT;
+ISO-8601 TEXT (="YYYY-MM-DD HH:MM:SS.SSS"=, UTC) is the documented alternative when
+SQLite date functions or human readability matter. No automatic reconstruction on read
+(§8.4).
+
+** 7.5 Integers: REAL binding and the 2^53 cliff
+Pitfall 1: JS numbers bind as REAL in *both* drivers (§2.3) — ='5.0'= ends up in TEXT
+columns and REAL in =ANY= columns, and =typeof()= lies. Position: integral safe numbers
+are converted to BigInt before binding (§5.7).
+Pitfall 2: reading INTEGER beyond ±2^53: better-sqlite3 rounds silently, node:sqlite
+throws (§2.3, §2.9). Position: =:safe-integers? false= by default (rowids and counters
+are far below 2^53; BigInts are awkward in CLJS arithmetic), documented; =:safe-integers?
+true= per connection or =:safe-integers?= per query flips reads to BigInt; the
+=lastInsertRowid= follows the same switch.
+
+** 7.6 Concurrency: one connection, serialised, IMMEDIATE transactions
+Pitfall: SQLite allows one writer at a time; two connections in one process racing on
+=BEGIN IMMEDIATE= produce =SQLITE_BUSY= after =busy_timeout= (=[LOCAL]= §2.4); DEFERRED
+transactions can fail with BUSY mid-way when upgrading to write (§2.5); the driver is
+synchronous so there is no benefit from a pool in one thread. Position: one connection
+per database per process (=core/db= returns one); =transact!= defaults to =:immediate= and
+rejects nested calls (=:reason :nested-transaction=; the driver's savepoint nesting is
+deliberately not exposed); =busy_timeout= 5000 ms default;
+multi-process access is supported by WAL + busy timeout, and =busy-error?= lets callers
+retry. No pool (uncertainty §8.13 covers worker threads).
+
+** 7.7 Only =?= parameters
+Position: the renderer emits anonymous =?= in order; named parameters are not exposed
+(better-sqlite3 rejects =?NNN=, prefixes differ between drivers, §5.6).
+
+** 7.8 Empty IN lists and WHERE-less writes
+Pitfall: =x IN ()= is a syntax error; =DELETE FROM t= without WHERE deletes everything.
+Position: =[:in x []]= renders =0=1= (=:not-in= → =1=1=); =:update=/=:delete-from= without
+=:where= is a dsl-error unless =:all? true=.
+
+** 7.9 WAL on network filesystems and WAL growth
+Pitfall: WAL "does not work over a network filesystem" (shared memory wal-index) and
+=journal_mode = WAL= silently returns the old mode when it cannot switch; long readers
+starve checkpoints and the =-wal= file grows [DOC wal][DOC bs3 performance.md]. Position:
+=core/open!= checks the returned mode and raises config-error =:reason :wal-unavailable=
+unless =:wal? :try=; =core/checkpoint!= exposes =wal_checkpoint(RESTART|TRUNCATE)=; the
+README warns against network shares (SQLite's own advice) and =:memory:= databases ignore
+WAL (=[LOCAL]= returns =memory=).
+
+** 7.10 Durability defaults
+Pitfall: with the driver's =SQLITE_DEFAULT_WAL_SYNCHRONOUS=1=, a WAL database opened by a
+new connection runs =synchronous=NORMAL= (a power loss can drop the last committed
+transactions; the file stays consistent) — and the same file under node:sqlite runs
+FULL (§4.1). Position: keep the driver default, expose =:synchronous :full= for callers
+who need power-loss durability, document it.
+
+** 7.11 REPLACE INTO is a DELETE
+Pitfall: =INSERT OR REPLACE= deletes the conflicting row (new rowid, FK cascades,
+columns not listed reset to defaults) (§3.15). Position: the DSL offers =:or :replace= but
+the docstring points to =:on-conflict ... :do-update-set= as the "upsert".
+
+** 7.12 Double-quoted string literals
+Pitfall: stock SQLite treats ="misspelled"= as a string literal (quirks §8). Position: the
+driver compiles =DQS=0= and the library never emits double quotes around values; an
+identifier typo therefore fails with =no such column= (=[LOCAL]=).
+
+** 7.13 NUL characters
+Pitfall: a NUL inside a bound string is stored intact but every SQL string function
+treats it as the end of the string (=[LOCAL]= =length()= = 1, §2.3; undefined per
+sqlite.org), and inside an identifier it would truncate the SQL text. Position:
+argument-error for both (identifiers already enforced in =util/ident-name=; values in
+=driver/->param=).
+
+** 7.14 CHECK / DEFAULT / view / partial-index expressions are literal SQL
+Pitfall: parameters are prohibited in schema expressions (=[LOCAL]= §3.4, §3.10, §3.11).
+Position: literal mode with a strict literal vocabulary (§6.3.9); user data never reaches
+DDL.
+
+** 7.15 =ON CONFLICT= fires only for uniqueness
+Pitfall: UPSERT does nothing for NOT NULL/CHECK/FK failures (§5.2); =IGNORE= also treats
+FK violations as ABORT (§3.15). Position: documented; =constraint-error?= + =sqlite-code=
+let callers branch on the extended code.
+
+** 7.16 =lastInsertRowid= is not a primary key
+Pitfall: meaningless for WITHOUT ROWID tables and for non-INTEGER PKs (§3.6). Position:
+=execute!= returns it verbatim but the docs steer to =:returning=.
+
+** 7.17 Statement caching vs schema changes
+Pitfall: a cached prepared statement survives =ALTER TABLE= (auto-recompile, =[LOCAL]=
+§2.2) but =columns()= metadata lags until re-execution. Position: the driver's statement
+cache is keyed by SQL text and cleared by =migrate!= after each migration (§8.12).
+
+* 8. Uncertainties (numbered; each has a recommended house position)
+1. *SQLite version skew between the driver and node:sqlite.* better-sqlite3 13.0.3 bundles
+   3.53.4 (=ALTER COLUMN SET NOT NULL= works =[LOCAL]=), Node 22.23.2 bundles 3.51.3. A
+   future node:sqlite binding must gate features on =sqlite_version()=. Position: =ddl=
+   checks the connection's version (=core/sqlite-version=) before rendering =:alter-column=
+   and =:->>=-style operators, raising dsl-error with the required version.
+2. *Prebuilt binary coverage.* 13.0.3 ships 8 prebuilds (§1.3); Electron and other
+   runtimes are "theoretically" supported by N-API [DOC bs3 v13.0.0 notes]. Untested
+   here. Position: document =npm rebuild= / =electron-rebuild=; not a library concern.
+3. *node:sqlite promotion on Node 22.* Docs for the 22 line still say Stability 1.1;
+   whether the ExperimentalWarning will ever disappear on 22.x is unknown. Position: not
+   relevant while better-sqlite3 is the driver; revisit if the house moves to Node ≥ 25.
+4. *Reading booleans/dates back.* Without schema knowledge the library cannot turn
+   INTEGER 1 into =true= or epoch ms into =js/Date=. Options: (a) leave raw (current
+   position), (b) optional per-query =:coerce {:active :boolean :created-at :date}= map,
+   (c) derive from =table_xinfo= declared types (only for =:boolean=/=:datetime=-like
+   type names, which STRICT forbids). Position: (a) now; (b) in phase 3 as an explicit
+   opt-in. *Phase 3:* (b) shipped as the per-query =:coerce {:col :boolean|:date|:number
+   |:bigint|:json|:keyword|fn}= option of =query/query-all!= etc.
+5. *=Infinity= binding.* better-sqlite3 stores REAL Infinity (=[LOCAL]=); node:sqlite
+   keeps it too; the value is not JSON-serialisable and compares oddly. Position:
+   argument-error (§5.7) — confirm no house use case needs ±Infinity.
+6. *Non-strict type names.* Whether to allow =[:raw "VARCHAR(255)"]= as a column type for
+   legacy schemas (affinity TEXT). Position: allow only via =:raw= and only when
+   =:strict? false=, documented as compatibility.
+7. *Triggers in the DSL.* The DSL sketch (§3.12) renders trigger bodies in literal mode;
+   the value of a data-driven trigger DSL vs. =:raw= strings is unclear. Position: phase 3
+   ships =:create-trigger= with =:raw= body strings only; revisit on demand.
+8. *=application_id=.* Whether =migrate!= should stamp it. Position: optional
+   =:application-id= (integer) written on the first migration; never asserted on read.
+9. *Window frames.* Frame specifications (=ROWS BETWEEN ...=) and =EXCLUDE= are omitted
+   from the phase-3 DSL; =[:raw]= covers them. Position: add only if a house project asks.
+10. *=trusted_schema=OFF= impact.* With it OFF, "SQL functions and virtual tables that
+    have not been security audited" (i.e. application-defined functions) cannot be used
+    by views, triggers, CHECK/DEFAULT clauses, generated columns or index expressions
+    [DOC pragma]. Whether any house schema needs a UDF inside a DEFAULT is unknown.
+    Position: default OFF (sqlite.org's recommendation); =core/open!= =:trusted-schema?
+    true= opts back in; phase 2 adds a test that a DEFAULT calling a UDF fails under OFF.
+11. *=PRAGMA optimize= on close.* Recommended by sqlite.org for long-lived connections;
+    cost on huge databases unknown. Position: opt-in =:optimize? true= on =close!=.
+12. *Statement cache size and invalidation.* A per-connection LRU keyed by SQL text
+    (default 100 entries?) — memory vs. prepare cost is unmeasured. Position: 128 entries,
+    cleared by =migrate!= and by =exec!=; measure in phase 5 smoke.
+13. *Worker-thread mode.* One connection per worker is documented [DOC bs3 threads.md];
+    whether the house needs it (long analytical queries) is unknown. Position: out of
+    scope; the driver namespace is the seam.
+14. *Large IN lists / bulk inserts.* 32766 parameters per statement; =json_each(?)= with a
+    JSON array parameter or a temp table are the standard workarounds. Position:
+    =core/insert-many!= chunks rows in one transaction; =[:in x coll]= with > 32766 values
+    is a dsl-error suggesting =[:in x [:json-each ...]]= (phase 3 decides the shape).
+    *Phase 3:* =query/execute!= chunks a DSL insert transparently (=dsl/render-chunked=,
+    =:max-params= override for tests); =[:in x coll]= switches to =json_each(?)= above 500
+    values (=:in-json-threshold=), so no IN list ever approaches the parameter limit.
+15. *Rows with duplicate column names.* =SELECT a.id, b.id= yields one =id= key in the row
+    object (last wins) — better-sqlite3's =expand()= disambiguates by table, node:sqlite
+    cannot. Position: the DSL requires aliases when a select would collide (renderer
+    detects duplicate result names and raises dsl-error); =expand= is not exposed.
+    *Phase 3:* implemented for names the renderer can see (columns, aliases); =*= and
+    un-aliased expressions are not checked.
+16. *=synchronous= visible value after WAL switch.* On the connection that *switched* to WAL
+    the pragma still reads 2; a *new* connection reads 1 (=[LOCAL]= §4.1). Position:
+    =core/open!= sets WAL then re-reads =synchronous= and reports the effective value in
+    =driver-info=; document that the switching connection keeps FULL until reopened.
+17. *=busy_timeout= vs. =SQLITE_BUSY_SNAPSHOT=.* In WAL, a DEFERRED transaction that read
+    and then writes after another writer committed gets =SQLITE_BUSY_SNAPSHOT= immediately
+    (no wait). Position: =:immediate= default (§7.6) avoids it; document the code.
+18. *node-sqlite3 (sqlite3 npm) deprecation date.* The README states deprecated /
+    unmaintained without a date; 6.0.1 was published 2026-03-12 [NPM]. Position:
+    irrelevant to the decision; recorded for the record.
+
+* 9. Phase 2/3 implementation (as shipped)
+Namespaces under =src/sqlite_cljs/=; every database operation returns a promesa promise
+that is already settled (§1.5); renderers and predicates are pure. The driver is loaded
+lazily by =sqlite-cljs.core= only. The phase-1 plan had a separate =driver= namespace and
+named the DML renderer =query=; the shipped layout below is the reference.
+
+** 9.1 =sqlite-cljs.core= — the ONE interop namespace (connection + driver binding)
+| fn                                            | Purpose                                                                                                   |
+|-----------------------------------------------+-----------------------------------------------------------------------------------------------------------|
+| =(db)= =(db path)= =(db opts)=                | synchronous constructor → db value ={:db :path :memory? :open-opts :effective :cache}=; opts =:path :memory? :readonly? :file-must-exist? :timeout-ms (5000) :safe-integers? :foreign-keys? (true) :journal-mode (:wal for files) :require-journal-mode? (true) :synchronous :trusted-schema? (false) :cache-size (128)=; =:effective= reports the values SQLite answered (journal mode, synchronous, foreign keys, busy timeout, trusted schema) |
+| =(close! d opts)=, =(open? d)=, =(in-transaction? d)= | idempotent close (=:optimize? true= runs PRAGMA optimize); synchronous predicates                  |
+| =(pragma d name opts)=, =(pragma! d name value)=, =(user-version d)= | validated PRAGMA get (=:arg=, =:rows?=) / set (returns the re-read value)                  |
+| =(sqlite-version d)=, =(library-version d)=, =(driver-info d)= | version strings / info map                                                                  |
+| =(define-function! d name f opts)=            | scalar UDF                                                                                                |
+| =(->param v)=, =(->params coll)=              | value binding (§5.7): integral numbers → BigInt (INTEGER), booleans → 1/0, keyword → name, NaN/±Infinity/js/Date/collections/unsafe integers → argument-error |
+| =(bigint->number v)=, =(bigint?* v)=, =(coerce-row coerce row)= | read helpers; =:coerce= kinds =:boolean :date :number :bigint :json :keyword= or fn         |
+| =(clear-cache! d)=, =(cache-size d)=, =(cached? d sql)= | statement LRU (128, keyed by SQL text)                                                            |
+| =(wrap-error e sql)=                          | SqliteError → sqlite-error ={:code "SQLITE_..." :message :sql :cause}=; RangeError/TypeError → argument-error =:reason :closed|:multiple-statements|:not-a-reader|:parameter-count|:unbindable-value|:value-too-big= |
+| =prepare* run* all* get* columns* exec* pragma* transaction* sqlite-version* reader?*= | synchronous internals used by =query= / =migrate= (not part of the promise API) |
+
+** 9.2 =sqlite-cljs.query= — execute layer
+| fn                                                     | Returns / notes                                                                                                   |
+|--------------------------------------------------------+-------------------------------------------------------------------------------------------------------------------|
+| =(->statement q opts)=                                 | pure: string / =[sql & params]= / ={:sql :params}= / DSL map → ={:sql :params}=                                       |
+| =(query-all! d q opts)=                                | vector of kebab row maps; opts =:coerce :safe-integers?=                                                          |
+| =(query-one! d q opts)=, =(query-value! d q opts)=      | first row or nil / first column of first row                                                                       |
+| =(execute! d q opts)=                                  | ={:changes n :last-insert-rowid n}= or RETURNING rows; DSL inserts above =:max-params= are chunked in one transaction |
+| =(execute-all! d qs opts)=                             | vector of statements (DDL maps included) in one IMMEDIATE transaction unless one is active                         |
+| =(exec! d sql-or-vec)=                                 | parameter-less SQL string(s) / DDL maps; clears the statement cache                                                |
+| =(transact! d f)=, =(transact! d mode f)=              | =:immediate= default, =:deferred=, =:exclusive=; synchronous body, deref settled promises inside; rollback on throw; nested → argument-error; promise-returning body → argument-error =:async-body= |
+| =(clear-cache! d)=                                     |                                                                                                                   |
+
+** 9.3 =sqlite-cljs.dsl= — DML renderer (pure)
+=(render q opts)= → ={:sql :params}=; =(render-chunked q opts)= → vector of statements;
+=(render-expr e opts)=; =(render-literal e)= (DDL literal mode); =(statement-kind q)=;
+=type-names=, =default-in-json-threshold= (500), =default-max-params= (32766). Grammar: §6.3.
+
+** 9.4 =sqlite-cljs.ddl= — DDL renderer (pure)
+=(render d opts)= / =(render-table-def d opts)= → ={:statements [..]}=; per-statement
+=create-table-sql create-index-sql create-view-sql create-trigger-sql alter-table-sql
+drop-sql=, fragments =column-sql constraint-sql type-sql=, =def-kind=, =def-name=,
+=expected-columns= (for =migrate!= drift), vocabularies =strict-types all-types fk-actions
+conflict-clauses default-keywords=. The introspection helpers sketched in phase 1
+(=table-info!=, =introspect!=, =diff=, =lint=) were not needed for phase 3 and are not shipped.
+
+** 9.5 =sqlite-cljs.migrate=
+=(migrate! d defs opts)= (§6.4), =(status! d)=, =(validate defs)= (pure), synchronous
+introspection internals =object-type*= and =table-columns*=.
+
+** 9.6 =sqlite-cljs.util= (phase 0 + additions)
+=kebab->snake=, =snake->kebab=, =transform-keys=, =ident-name=, =sql-ident=,
+=sql-qualified=, =row->clj=, =rows->clj=, error constructors (=sqlite-error=,
+=argument-error=, =dsl-error=, =config-error=, =migration-error=), =error-data=,
+=error-type=, =sqlite-code=, =constraint-error?=, =busy-error?=; phase 3 added
+=sql-string-literal= (literal mode, §6.3.9), =version-vec=, =version>==.
+
+** 9.7 Tests (phase 2/3, shipped)
+- =dsl_test= / =ddl_test=: pure golden-string tests for every §6.3 shape, injection strings in
+  identifier and value positions, every rejected shape (=:form= / =:column= in the error data).
+- =core_test=, =query_test=, =migrate_test=: =:memory:= databases (plus one temporary file
+  under =target/= for WAL / read-only / SQLITE_BUSY with two connections): STRICT
+  rejections, UPSERT RETURNING, FK cascade, transactions (commit, rollback on throw and on a
+  rejected deref, nested rejection, async-body rejection), statement-cache LRU, chunked bulk
+  inserts (small =:max-params= override plus one real 36 000-parameter insert), json_each IN
+  lists, =:coerce=, BigInt reads, migrate! create / idempotent re-run / drift / alter
+  evolution / user_version guard.
+- =run-tests.sh= stays network-free: 88 tests / 560 assertions.
+
+* 10. Sources (all read 2026-09-25)
+** SQLite (sqlite.org)
+- https://sqlite.org/lang_createtable.html (page updated 2025-04-30)
+- https://sqlite.org/lang_createindex.html (2026-05-06)
+- https://sqlite.org/lang_createview.html
+- https://sqlite.org/lang_createtrigger.html
+- https://sqlite.org/lang_altertable.html
+- https://sqlite.org/lang_droptable.html , https://sqlite.org/lang_dropindex.html , https://sqlite.org/lang_dropview.html
+- https://sqlite.org/datatype3.html
+- https://sqlite.org/stricttables.html
+- https://sqlite.org/withoutrowid.html
+- https://sqlite.org/autoinc.html
+- https://sqlite.org/gencol.html
+- https://sqlite.org/foreignkeys.html
+- https://sqlite.org/lang_conflict.html (2025-11-22)
+- https://sqlite.org/lang_insert.html (2026-05-14) , https://sqlite.org/lang_replace.html
+- https://sqlite.org/lang_upsert.html (2024-04-11)
+- https://sqlite.org/lang_returning.html (2025-05-31)
+- https://sqlite.org/lang_update.html , https://sqlite.org/lang_delete.html
+- https://sqlite.org/lang_select.html , https://sqlite.org/lang_with.html (2025-05-12)
+- https://sqlite.org/windowfunctions.html
+- https://sqlite.org/lang_expr.html (parameters §4)
+- https://sqlite.org/lang_keywords.html , https://sqlite.org/lang_naming.html
+- https://sqlite.org/lang_transaction.html (2026-02-18) , https://sqlite.org/lang_savepoint.html
+- https://sqlite.org/pragma.html
+- https://sqlite.org/wal.html
+- https://sqlite.org/rescode.html
+- https://sqlite.org/quirks.html
+- https://sqlite.org/limits.html
+- https://sqlite.org/c3ref/bind_blob.html
+- https://sqlite.org/json1.html
+- https://sqlite.org/changes.html (feature introduction versions)
+** Node.js
+- https://nodejs.org/docs/latest-v22.x/api/sqlite.html (rendered as v22.23.3 documentation; history table and Stability 1.1)
+- https://nodejs.org/api/sqlite.html (current, rendered as v26.10.0; Stability 1.2 since v25.7.0)
+** better-sqlite3 (WiseLibs)
+** node-sqlite3 (TryGhost)
+** npm registry
+- =npm view better-sqlite3= (latest 13.0.3, modified 2026-08-05), =npm view sqlite3= (6.0.1, modified 2026-03-12)
+- https://api.npmjs.org/downloads/point/last-week/better-sqlite3 , .../sqlite3 , .../libsql , .../node-sqlite3-wasm (week 2026-09-15..21)
+** honeysql (seancorfield)
+** Local probes (this machine, 2026-09-25)
+- Node v22.23.2, npm 10.9.8, OpenJDK 21.0.12.1, Linux 7.0.0-31-generic x86_64.
+- =npm install= of better-sqlite3 ^12.4.1 (resolved 12.11.1, prebuild-install download, SQLite 3.53.2) and then ^13.0.3 (13.0.3, bundled N-API prebuilds, no compiler invoked, SQLite 3.53.4).
+- Probe scripts (kept in the job's tmp dir, not in the repo): node:sqlite feature/binding probe; better-sqlite3 12.11.1 and 13.0.3 binding/error/transaction/pragma probes; DDL parameter-rejection and version-gated syntax probe; two-connection SQLITE_BUSY probe on a temp WAL file.

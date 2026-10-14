@@ -1,0 +1,39 @@
+;; shadow-cljs configuration for sqlite-cljs.
+;; Standalone (no :deps) so `npx shadow-cljs ...` only needs Java + node_modules.
+;; promesa (pure ClojureScript, no npm package) is resolved from Clojars by the
+;; standalone shadow-cljs CLI via the :dependencies key below; deps.edn mirrors
+;; The only npm runtime dependency is the wrapped driver (better-sqlite3, inventory §1);
+;; it is required from exactly one namespace (sqlite-cljs.core) at runtime.
+{:source-paths ["src" "test" "dev"]
+ :dependencies [[funcool/promesa "12.0.1"]]
+ :builds
+ {;; Unit tests. `npx shadow-cljs compile node-test` compiles AND runs them (:autorun).
+  ;; NOTE: shadow's autorun does not propagate the test exit status, so ./run-tests.sh
+  ;; compiles with `--config-merge '{:autorun false}'` and runs `node target/node-test.js`.
+  :node-test {:target :node-test
+              :output-to "target/node-test.js"
+              :ns-regexp "-test$"
+              :autorun true}
+
+  ;; Interactive development build for a Node REPL:
+  ;;   npx shadow-cljs watch dev          ; terminal 1: compiles + hot reloads
+  ;;   node target/dev.js                 ; terminal 2: starts the Node runtime the REPL attaches to
+  ;;   npx shadow-cljs cljs-repl dev      ; terminal 3: REPL inside that Node process
+  :dev {:target :node-script
+        :main sqlite-cljs.dev/main
+        :output-to "target/dev.js"
+        :devtools {:enabled true}}
+
+  ;; Phase 4 LIVE smoke: the library against a real file database in a fresh
+  ;; temp directory (removed afterwards) plus a :memory: database; no network.
+  ;;   npx shadow-cljs compile smoke && node target/smoke.js
+  :smoke {:target :node-script
+          :main sqlite-cljs.smoke/main
+          :output-to "target/smoke.js"}
+
+  ;; The quick start of the README (dev/sqlite_cljs/examples.cljs): a
+  ;; database in memory; prints the rows it read. No file, no network.
+  ;;   npx shadow-cljs compile examples && node target/examples.js
+  :examples {:target :node-script
+             :main sqlite-cljs.examples/main
+             :output-to "target/examples.js"}}}

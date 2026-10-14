@@ -1,0 +1,1313 @@
+#+TITLE: sqlite-cljs Manual
+#+SUBTITLE: A ClojureScript (Node.js) SQLite client — data-driven DDL and query DSL (honeysql-style, SQLite dialect) over better-sqlite3, idempotent migrate!, promesa promises
+#+DATE: 2026-09-25
+#+OPTIONS: toc:2 num:t ^:nil
+#+LANGUAGE: en
+
+* Introduction
+
+=sqlite-cljs= is an idiomatic ClojureScript (Node.js) client for [[https://sqlite.org][SQLite]]. Its point is
+not the driver call — better-sqlite3 already makes that a one-liner — but *what you hand
+the driver*: ClojureScript data. Tables, indexes, views, triggers and every SELECT /
+INSERT / UPDATE / DELETE are maps and vectors in a honeysql-inspired dialect that the
+library renders into SQLite SQL, so that at call sites:
+
+- *values are always bound parameters* (=?=, left to right), never text spliced into SQL;
+- *identifiers are always strictly quoted* (="user_name"=, embedded quotes doubled), so a
+  hostile table or column name is an inert name, never code;
+- *the schema is data too*: a vector of table definitions is what =migrate!= brings a
+  database up to, idempotently, with drift detection instead of silent divergence.
+
+It covers:
+
+- *One connection binding* — =sqlite-cljs.core= is the only namespace that touches the
+  It opens the database with house pragmas (WAL, =foreign_keys= on, =busy_timeout=
+  5000 ms, =trusted_schema= off), reports the values SQLite *actually* answered, binds
+  values losslessly and maps every driver error to a structured =ex-info=.
+- *A DDL DSL* (=sqlite-cljs.ddl=) — =CREATE TABLE= (STRICT by default), indexes including
+  partial and expression indexes, views, triggers, =ALTER TABLE= gated on the connection's
+  SQLite version, and =DROP=.
+- *A query DSL* (=sqlite-cljs.dsl=) — selects with joins, CTEs, window functions and
+  compounds; inserts with multi-row =VALUES=, =INSERT … SELECT= and full UPSERT
+  (=ON CONFLICT … DO UPDATE SET … WHERE … RETURNING=); updates and deletes; a =[:raw …]=
+  hatch; automatic =json_each= for big =IN= lists and chunking for bulk inserts.
+- *=migrate!=* (=sqlite-cljs.migrate=) — an idempotent "bring the database up to these
+  definitions" apply with explicit alters, drift errors and a =user_version= fingerprint.
+- *An execute layer* (=sqlite-cljs.query=) — =query-all!= / =query-one!= / =query-value!= /
+  =execute!= / =execute-all!= / =exec!= / =transact!= returning kebab-keyed row maps through
+  promesa promises, with a per-connection prepared-statement LRU.
+
+It is meant to be consumed *as a source dependency* by another shadow-cljs Node app
+(namespace prefix =sqlite-cljs.*=) and follows the house contract shared with
+=openrouter-cljs=, =coinbase-cljs= and =kraken-cljs=:
+
+- *Kebab-cased keyword maps in and out.* =:user-name= renders as ="user_name"=; row
+  columns come back as =:user-name=. Values are never translated on the way out (INTEGER
+  → number, REAL → number, TEXT → string, BLOB → Buffer, NULL → nil) unless a per-query
+  =:coerce= map asks for it.
+- *No JavaScript interop at call sites.* Every driver property read is an =unchecked-get=
+  and every call a =js-invoke= inside =sqlite-cljs.core=; the public API carries no =^js=
+  hints, and callers never see a driver object.
+- *promesa promises for every database operation* (=promesa.core=): compose with =p/let=,
+  =p/->=, =p/catch=. The driver is synchronous, so every promise is *already settled* when
+  returned — inside a =transact!= body you deref them (see [[Transactions]]).
+- *One npm runtime dependency*: the driver itself. Everything else is ClojureScript
+  (=funcool/promesa=).
+- *Structured errors.* Every rejection is an =ex-info= with a =:type= in a five-value
+  taxonomy and, for SQLite's own errors, the extended result code as a string
+  (="SQLITE_CONSTRAINT_UNIQUE"=); see [[Error handling]].
+
+** The binding-namespace architecture
+
+The library is layered so that exactly one namespace knows there is a JavaScript driver
+at all (inventory 9):
+
+| namespace              | role                                                                              | I/O  |
+|------------------------+-----------------------------------------------------------------------------------+------|
+| =sqlite-cljs.util=     | kebab/snake translation, strict identifier quoting, row conversion, error constructors, version compare | none |
+| =sqlite-cljs.dsl=      | DML renderer: statement map ⇒ ={:sql :params}=; literal mode for DDL expressions   | none |
+| =sqlite-cljs.ddl=      | DDL renderer: definition map ⇒ ={:statements ["CREATE …"]}=; STRICT validation      | none |
+| =sqlite-cljs.core=     | *the* driver binding: =db= / =close!=, pragmas, value binding, statement cache, error mapping, synchronous internals | driver |
+| =sqlite-cljs.query=    | execute layer over =core=: query designators ⇒ rows / change counts, =transact!=    | via core |
+| =sqlite-cljs.migrate=  | =migrate!=, =status!=, =validate= over =core= + =ddl=                                 | via core |
+
+The three renderers are pure and fully unit-tested against golden SQL strings; they are
+also what you call when you only want the SQL (=dsl/render=, =ddl/render=). =core= exposes
+its synchronous internals with a =*= suffix (=run*=, =all*=, =pragma*=, =transaction*= …)
+for =query= and =migrate=; they are not part of the promise API and are listed in the
+[[API reference]] for completeness only.
+
+Where this manual says "verified live" it refers to the phase-4 live smoke of 2026-09-25
+(=dev/sqlite_cljs/smoke.cljs=: a real file database in a fresh temporary directory plus a
+=:memory:= database side by side, 11 sections all passing — versions and effective
+pragmas, =migrate!= and its idempotent re-run, DSL inserts / upsert RETURNING / joins,
+transactions, boolean and date round trips, a 1000-row chunked bulk insert, drift and the
+=user_version= guard, live injection attempts in value and identifier positions, the
+statement cache, STRICT mode and the error taxonomy). The raw research behind the
+library — driver choice, the SQLite grammar census, PRAGMAs, the DSL design, pitfalls and
+uncertainties with their house positions — is =docs/sqlite-api-inventory.org=; section
+numbers quoted as "inventory 7.5" point there.
+
+* Install and quick start
+
+** Requirements
+
+- Node.js 22+ (the repo is developed and smoked on Node 22.23.2; better-sqlite3 13.x
+  ships prebuilt binaries for Node 20/22/24 on the common platforms, otherwise
+  =npm install= compiles it with =node-gyp=)
+- Java 11+ for shadow-cljs
+- The driver in the *consumer's* =node_modules=: =npm install better-sqlite3=. It is
+  required lazily from =sqlite-cljs.core= on the first =db= call; a missing driver is a
+  =:sqlite-cljs/config-error= with =:reason :driver-missing= naming the install command.
+
+** Source dependency
+
+dependency. Its own =deps.edn= declares ClojureScript and promesa, so a consumer's
+=deps.edn= only needs:
+
+#+begin_src clojure
+        }}
+#+end_src
+
+The consumer's =shadow-cljs.edn= uses =:deps true= so the classpath comes from =deps.edn=,
+and its =package.json= lists =better-sqlite3=. Then require the namespaces you need:
+
+#+begin_src clojure
+(ns my.app
+  (:require [promesa.core :as p]
+            [sqlite-cljs.core :as core]
+            [sqlite-cljs.ddl :as ddl]
+            [sqlite-cljs.dsl :as dsl]
+            [sqlite-cljs.migrate :as migrate]
+            [sqlite-cljs.query :as q]
+            [sqlite-cljs.util :as util]))
+#+end_src
+
+** Open a database
+
+#+begin_src clojure
+(def d (core/db "app.db"))          ; file: WAL, foreign_keys on, busy_timeout 5000 ms
+(def m (core/db))                   ; :memory:
+(:effective d)
+;; => {:journal-mode "wal" :synchronous 2 :foreign-keys? true
+;;     :busy-timeout-ms 5000 :trusted-schema? false :safe-integers? false}
+#+end_src
+
+=db= is the one *synchronous* constructor: it returns the db value (a map) directly,
+not a promise. Everything you do with it returns a promise.
+
+** Declare the schema and =migrate!=
+
+#+begin_src clojure
+(def schema
+  [{:create-table :orgs
+    :columns [[:id :integer {:primary-key? true}]
+              [:name :text {:not-null? true :unique? true}]]}
+   {:create-table :users
+    :columns [[:id :integer {:primary-key? true}]
+              [:email :text {:not-null? true :unique? true :collate :nocase}]
+              [:name :text {:not-null? true}]
+              [:active :integer {:not-null? true :default true}]              ; booleans are 0/1
+              [:org-id :integer {:references {:table :orgs :column :id :on-delete :cascade}}]
+              [:created-at :integer {:not-null? true                          ; dates are epoch ms
+                                     :default [:raw "(unixepoch('subsec') * 1000)"]}]]
+    :indexes [[:users-org-idx [:org-id]]]}
+   {:create-view :active-users
+    :as {:select [:id :email :name] :from :users :where [:= :active 1]}}])
+
+(p/let [report (migrate/migrate! d schema)]
+  report)
+;; first run  => {:created [:orgs :users :users-org-idx :active-users] :existing [] :altered [] :dropped []
+;;                :user-version 3 :previous-user-version 0 :sqlite-version "3.53.4"}
+;; second run => {:created [] :existing [:orgs :users :users-org-idx :active-users] ... :user-version 3 ...}
+#+end_src
+
+Tables are =STRICT= unless you say otherwise, so a text value in an INTEGER column fails
+at write time (=SQLITE_CONSTRAINT_DATATYPE=) instead of being stored as text.
+
+** One query end to end
+
+#+begin_src clojure
+(p/let [orgs  (q/execute! d {:insert-into :orgs :values [{:name "acme"} {:name "globex"}] :returning [:id :name]})
+        acme  (:id (first orgs))
+        _     (q/execute! d {:insert-into :users
+                             :values [{:email "ada@acme" :name "Ada" :active true :org-id acme}
+                                      {:email "bob@acme" :name "Bob" :active true :org-id acme}]})
+        up    (q/execute! d {:insert-into :users
+                             :values [{:email "ADA@ACME" :name "Ada Lovelace" :active true :org-id acme}]
+                             :on-conflict [:email]
+                             :do-update-set {:name :excluded/name}
+                             :where [:<> :users/name :excluded/name]
+                             :returning [:id :name]})
+        rows  (q/query-all! d {:select [[:u/name :user] [:o/name :org] :u/email]
+                               :from [:users :u]
+                               :joins [[:join [:orgs :o] [:= :o/id :u/org-id]]]
+                               :where [:and [:= :u/active true] [:like :u/email "%@acme"]]
+                               :order-by [[:u/name :desc]]
+                               :limit 2})]
+  [up rows])
+;; => [[{:id 1 :name "Ada Lovelace"}]
+;;     [{:user "Bob" :org "acme" :email "bob@acme"} {:user "Ada Lovelace" :org "acme" :email "ada@acme"}]]
+#+end_src
+
+Every value above — ="acme"=, =true=, ="%@acme"=, the =:limit= — travelled as a =?=
+parameter. The SQL that ran for the last query was:
+
+#+begin_src sql
+SELECT "u"."name" AS "user", "o"."name" AS "org", "u"."email" FROM "users" AS "u"
+INNER JOIN "orgs" AS "o" ON "o"."id" = "u"."org_id"
+WHERE ("u"."active" = ? AND "u"."email" LIKE ?) ORDER BY "u"."name" DESC LIMIT ?
+#+end_src
+
+(=dsl/render= gives you exactly that ={:sql … :params [1 "%@acme" 2]}= without a
+database.) Close with =(core/close! d)= when the process is done with the file.
+
+* Clients: the db value
+
+** =core/db=
+
+=(core/db)=, =(core/db path)= or =(core/db opts)= opens a connection and returns the *db
+value*, a plain map:
+
+#+begin_src clojure
+{:db        <raw driver connection — opaque, never use it directly>
+ :path      ":memory:" or the file path
+ :memory?   true for in-memory databases
+ :open-opts the options db was called with
+ :effective {:journal-mode "wal" :synchronous 1 :foreign-keys? true
+             :busy-timeout-ms 5000 :trusted-schema? false :safe-integers? false}
+ :cache     <statement cache>}
+#+end_src
+
+The db value *is* the connection: one per database per process (inventory 7.6). Pass it to
+every function in =sqlite-cljs.query= and =sqlite-cljs.migrate=. Options:
+
+| option                   | default                       | meaning                                                                                                |
+|--------------------------+-------------------------------+--------------------------------------------------------------------------------------------------------|
+| =:path=                  | =":memory:"=                  | file path; =":memory:"= or =:memory? true= for an in-memory database                                     |
+| =:memory?=               | =false=                       | in-memory database (journal mode is always ="memory"=; cannot be read-only)                              |
+| =:readonly?=             | =false=                       | open read-only (file databases only; writes raise =SQLITE_READONLY=)                                     |
+| =:file-must-exist?=      | =false=                       | fail with =SQLITE_CANTOPEN= instead of creating the file                                                 |
+| =:timeout-ms=            | =5000=                        | =busy_timeout=: how long a writer waits for a lock before =SQLITE_BUSY=                                  |
+| =:safe-integers?=        | =false=                       | read INTEGER columns as BigInt (see [[Value binding]])                                                   |
+| =:foreign-keys?=         | =true=                        | =PRAGMA foreign_keys= (set explicitly every open: it is per connection and off in stock SQLite)          |
+| =:journal-mode=          | =:wal= for files              | =:wal :delete :truncate :persist :memory :off=; ignored for =:memory:= databases                          |
+| =:require-journal-mode?= | =true=                        | raise =config-error {:reason :journal-mode-unavailable}= when SQLite kept another mode (WAL on a network share) |
+| =:synchronous=           | driver default                | =:off :normal :full :extra= (or 0–3); omitted ⇒ NORMAL for a WAL database opened by a fresh connection, FULL otherwise |
+| =:trusted-schema?=       | =false=                       | =PRAGMA trusted_schema= (sqlite.org's recommendation is off; opt in if a UDF must run inside a view/CHECK/DEFAULT) |
+| =:cache-size=            | =128=                         | prepared statements kept per connection (LRU keyed on SQL text)                                          |
+
+Construction errors are thrown synchronously: =:sqlite-cljs/config-error= (=:reason
+:bad-options= for a read-only =:memory:=, a negative timeout, an unknown journal mode;
+=:open-failed= for an unopenable directory; =:driver-missing=) or =:sqlite-cljs/sqlite-error=
+with SQLite's own code (=SQLITE_CANTOPEN= with =:file-must-exist?=, =SQLITE_READONLY=).
+
+** Effective values, not requested values
+
+=:effective= (also in =driver-info=) holds what SQLite answered after the pragmas were
+
+- *=:journal-mode=*: =PRAGMA journal_mode = WAL= returns the mode SQLite kept; on a
+  network filesystem that is the old mode. With the default =:require-journal-mode? true=
+  the constructor closes the connection and raises =config-error {:reason
+  :journal-mode-unavailable :wanted :wal :actual "delete"}= rather than silently running
+  without WAL; pass =:require-journal-mode? false= to accept whatever SQLite kept. A
+  =:memory:= database always answers ="memory"= and never errors.
+- *=:synchronous=*: the driver builds SQLite with =SQLITE_DEFAULT_WAL_SYNCHRONOUS=1=, so a
+  WAL database opened by a *fresh* connection runs NORMAL (=1=), while the connection that
+  *switched* the file to WAL still reads FULL (=2=) until reopened (inventory 8.16; verified
+  live: the smoke's first open reports =2=). NORMAL in WAL mode means a power loss can
+  drop the last committed transactions while the file stays consistent (inventory 7.10);
+  pass =:synchronous :full= if that matters.
+
+** Reading and setting pragmas
+
+#+begin_src clojure
+(core/pragma d :journal-mode)                          ; => "wal"       (first column of the first row)
+(core/pragma d :table-info {:arg :users :rows? true})  ; => [{:cid 0 :name "id" :type "INTEGER" :notnull 0 :dflt-value nil :pk 1} ...]
+(core/pragma! d :user-version 7)                       ; => 7           (set, then re-read)
+(core/pragma! d :journal-mode :wal)                    ; => "wal" (or the mode SQLite kept)
+(core/user-version d)                                  ; => 7
+#+end_src
+
+Names are keywords rendered kebab→snake and validated as identifiers; values are
+validated as bare words, integers, booleans or keywords — never user data. =PRAGMA
+foreign_keys= is a no-op inside a transaction (SQLite rule), so set it at open time.
+
+** Versions and =driver-info=
+
+#+begin_src clojure
+(core/sqlite-version d)   ; => "3.53.4"   (the bundled SQLite library)
+(core/library-version d)  ; => "13.0.3"   (the driver package)
+(core/driver-info d)
+;; => {:driver "better-sqlite3" :driver-version "13.0.3" :sqlite-version "3.53.4"
+;;     :path "app.db" :memory? false :readonly? false :open? true :effective {...}}
+#+end_src
+
+** Predicates and =close!=
+
+#+begin_src clojure
+(core/open? d)             ; synchronous, true while open
+(core/in-transaction? d)   ; synchronous, true inside transact! (or after a manual BEGIN)
+(core/close! d)                     ; resolves to nil; idempotent; clears the statement cache
+(core/close! d {:optimize? true})   ; runs PRAGMA optimize first (sqlite.org's advice for long-lived connections)
+#+end_src
+
+Using a closed db value rejects with =argument-error {:reason :closed}=.
+
+** Scalar user-defined functions
+
+#+begin_src clojure
+(p/let [_ (core/define-function! d "slug" (fn [s] (-> s str/lower-case (str/replace #"\s+" "-")))
+                                 {:deterministic? true})
+        r (q/query-value! d {:select [[[:slug :name] :s]] :from :users :where [:= :id 1]})]
+  r)
+;; => "ada-lovelace"
+#+end_src
+
+The name must match =[a-z_][a-z0-9_]*=; arguments arrive as driver values (numbers,
+strings, nil, Buffer; BigInt under =:safe-integers?=) and the return value must be
+bindable. With the default =:trusted-schema? false= such a function cannot be referenced
+from a view, trigger, CHECK, DEFAULT, generated column or index expression (inventory 8.10).
+
+* The DDL DSL
+
+=sqlite-cljs.ddl= turns a *definition map* into ={:statements ["CREATE …" …]}= — one SQL
+string per statement, never any parameters, because SQLite forbids parameters in CHECK,
+DEFAULT, view and partial-index expressions (inventory 7.14). Expressions inside DDL are
+rendered by the query DSL in *literal mode* (see [[Literal mode]]) with a restricted
+vocabulary, so user data never reaches DDL. You rarely call =ddl/render= yourself: hand the
+maps to =migrate!= (idempotent apply), =query/exec!= (run as is) or =query/execute-all!=.
+
+** Table definitions
+
+#+begin_src clojure
+{:create-table :users
+ :if-not-exists? true            ; default true
+ :strict? true                   ; default true
+ :without-rowid? false
+ :temp? false
+ :columns [[:id :integer {:primary-key? true}]
+           [:email :text {:not-null? true :unique? true :collate :nocase}]
+           [:active :integer {:not-null? true :default true}]
+           [:org-id :integer {:references {:table :orgs :column :id
+                                           :on-delete :cascade :on-update :restrict
+                                           :deferrable :initially-deferred}}]
+           [:created-at :integer {:not-null? true :default [:raw "(unixepoch('subsec') * 1000)"]}]
+           [:label :text {:generated-as {:expr [:|| :name " " :email] :stored? true}}]]
+ :primary-key [:a :b]            ; composite PK (only when no column has :primary-key?)
+ :unique [[:org-id :email] [:name]]
+ :check [[:>= :age 0]]
+ :foreign-keys [{:columns [:org-id] :table :orgs :ref-columns [:id]
+                 :on-delete :cascade :on-update :no-action}]
+ :constraints [[:unique [:a :b] {:name "ab_unique" :on-conflict :ignore}]]   ; raw table constraints
+ :indexes [[:users-email-idx [:email] {:unique? true}]
+           [nil [:org-id [:created-at :desc]] {:where [:= :active 1]}]]}      ; nil name ⇒ users_org_id_created_at_idx
+#+end_src
+
+Only =:create-table= and =:columns= are required. =:indexes= entries are =[name cols
+opts]= and render as separate =CREATE INDEX= statements after the table (=migrate!=
+creates them individually when absent). Unknown keys are an =argument-error=.
+
+** The column shape
+
+A column is =[name type opts-map]=; the opts map may be omitted for a bare column in a
+non-strict table but every STRICT column needs a type. Column opts:
+
+| opt                | value                                                       | renders                                          |
+|--------------------+-------------------------------------------------------------+--------------------------------------------------|
+| =:primary-key?=    | =true= / =:asc= / =:desc=                                     | =PRIMARY KEY [ASC/DESC]= (INTEGER ⇒ the rowid alias) |
+| =:autoincrement?=  | =true= (only with =:integer= + =:primary-key?=)               | =AUTOINCREMENT= — avoided per sqlite.org unless asked (inventory 7.2) |
+| =:not-null?=       | =true=                                                      | =NOT NULL=                                       |
+| =:unique?=         | =true=                                                      | =UNIQUE=                                         |
+| =:check=           | expression                                                  | =CHECK (…)= in literal mode                       |
+| =:default=         | literal / =:current-time= =:current-date= =:current-timestamp= =:null= =:true= =:false= / =[:raw "…"]= / expression | =DEFAULT …= (expressions are parenthesised; subqueries refused) |
+| =:collate=         | =:binary= =:nocase= =:rtrim= or a string                      | =COLLATE NOCASE=                                 |
+| =:references=      | ={:table :column :on-delete :on-update :deferrable}=          | =REFERENCES "orgs"("id") ON DELETE CASCADE …=     |
+| =:generated-as=    | ={:expr … :stored? bool}=                                     | =GENERATED ALWAYS AS (…) STORED/VIRTUAL=          |
+| =:on-conflict=     | =:rollback= =:abort= =:fail= =:ignore= =:replace=               | the conflict clause of the PK / NOT NULL / UNIQUE constraint |
+| =:name=            | string/keyword                                              | =CONSTRAINT "name"= before the PK                 |
+
+Foreign-key actions: =:no-action :restrict :set-null :set-default :cascade=;
+=:deferrable= is =true= / =false= / =:initially-deferred= / =:initially-immediate=. The
+bare spellings of inventory 6.3.1 (=:primary-key=, =:not-null=, =:unique=, =:autoincrement=,
+=:references [:orgs :id]= with =:on-delete= beside it, =:generated= + =:stored=) are
+accepted as aliases. Validation catches the SQLite rules before SQLite does: two columns
+with =:primary-key?= (use =:primary-key [cols]=), a generated column with a DEFAULT or as
+the PK, a table of only generated columns, =WITHOUT ROWID= without a PK, duplicate column
+names, and the =ADD COLUMN= restrictions (no PK/UNIQUE, NOT NULL needs a non-NULL default,
+no =CURRENT_*= or parenthesised default, no STORED generated column, REFERENCES needs
+DEFAULT NULL).
+
+** Types: STRICT by default and the legacy escape
+
+The type vocabulary is SQLite's STRICT set — =:integer :int :real :text :blob :any= —
+plus =:numeric= and =[:raw "VARCHAR(255)"]= *only* with =:strict? false=. Everything else is
+an =:sqlite-cljs/argument-error= naming the column:
+
+#+begin_src clojure
+(ddl/render {:create-table :flags :columns [[:id :integer {:primary-key? true}] [:on :boolean {}]]})
+;; throws argument-error {:column :on :column-type :boolean :reason :unknown-type}
+;;   "column :on: there is no BOOLEAN type; use :integer (0/1)"
+;; :datetime / :date / :timestamp ⇒ :unknown-type "use :integer epoch milliseconds (or :text ISO-8601)"
+;; :numeric or [:raw ..] under STRICT ⇒ :reason :strict-type
+#+end_src
+
+The house conventions (inventory 7.1, 7.4) are *INTEGER 0/1 for booleans* — bind =true= /
+=false= and they arrive as =1= / =0=; add =:check [:in :col [0 1]]= if you want SQLite to
+police it — and *INTEGER epoch milliseconds for dates* with =:default [:raw
+"(unixepoch('subsec') * 1000)"]=. Chapter [[Value binding]] shows both round trips.
+
+Legacy schemas that need their historical type names opt out per table:
+
+#+begin_src clojure
+{:create-table :legacy :strict? false
+ :columns [[:id :integer {:primary-key? true}]
+           [:label [:raw "VARCHAR(255)"] {}]
+           [:amount :numeric {}]]}
+;; => CREATE TABLE IF NOT EXISTS "legacy" ("id" INTEGER PRIMARY KEY, "label" VARCHAR(255), "amount" NUMERIC)
+#+end_src
+
+=migrate!= compares a raw type verbatim against =table_xinfo= (="VARCHAR(255)"=), so the
+legacy table verifies clean (verified live).
+
+** Table constraints
+
+=:primary-key [cols]=, =:unique [[cols] …]=, =:check [expr …]= and =:foreign-keys [{…}]=
+are the convenient spellings; =:constraints= takes the general vector forms
+=[:unique [cols] {:name :on-conflict}]=, =[:primary-key [cols] opts]=, =[:check expr opts]=
+and =[:foreign-key [cols] [table col …] {:on-delete :on-update :deferrable :name}]=, or a
+foreign-key map. Remember that SQLite does not index child keys automatically (inventory
+7.3): declare an index on every =:references= column you join or cascade on.
+
+** Indexes
+
+#+begin_src clojure
+{:create-index :posts-author-idx :on :posts :columns [:author-id [:score :desc]]}
+{:create-index :users-active-email :on :users :columns [[[:lower :email] :asc [:collate :nocase]]]
+ :unique? true :where [:= :active 1]}
+;; => CREATE UNIQUE INDEX IF NOT EXISTS "users_active_email" ON "users" (lower("email") COLLATE NOCASE ASC) WHERE "active" = 1
+#+end_src
+
+Index columns are =:col=, =[:col :desc]=, =[[expr] :asc [:collate :nocase]]= (an
+expression wrapped in its own vector, then flags) or a bare expression vector. =:where=
+(alias =:partial-where=) is rendered in literal mode. A nil or missing name derives
+=<table>_<cols>_idx=. =:table= is accepted for =:on=.
+
+** Views and triggers
+
+#+begin_src clojure
+{:create-view :active-users :columns [:id :email]
+ :as {:select [:id :email] :from :users :where [:= :active 1]}}
+
+{:create-trigger :posts-touch-user :on :posts :timing :after :event :insert
+ :when [:> :new/score 0]
+ :body ["UPDATE users SET updated_at = unixepoch('subsec') * 1000 WHERE id = NEW.author_id"
+        {:update :users :set {:active 1} :where [:= :id :new/author-id]}]}
+;; :event may also be :delete, :update or [:update :of [:score :title]]; :timing :before / :instead-of
+#+end_src
+
+A view's query is rendered in literal mode (views cannot take parameters). Trigger bodies
+are raw SQL strings by house position (inventory 8.7); DSL maps are accepted and rendered
+in literal mode, and =:new/col= / =:old/col= are ordinary qualified identifiers.
+
+** ALTER TABLE and version gating
+
+#+begin_src clojure
+{:alter-table :orgs :rename-to :organisations}
+{:alter-table :users :rename-column [:email :mail]}                      ; SQLite >= 3.25
+{:alter-table :users :add-column [:nickname :text {:not-null? true :default ""}]}
+{:alter-table :users :drop-column :legacy-flag}                          ; SQLite >= 3.35
+{:alter-table :users :alter-column [:nickname :set-not-null]}            ; SQLite >= 3.53 (:drop-not-null too)
+#+end_src
+
+Exactly one action per map. =(ddl/render def {:sqlite-version "3.53.4"})= enables the
+gates and refuses a statement the connection's SQLite cannot run with a
+=:sqlite-cljs/dsl-error {:requires "3.35.0" :sqlite-version …}=; without the option
+nothing is gated. =migrate!= always passes the connection's version; =execute-all!=
+forwards a =:sqlite-version= option when you give one. =:add-column= validates the column
+as STRICT unless the map says =:strict? false=.
+
+** DROP
+
+={:drop-table :t}=, ={:drop-index :i}=, ={:drop-view :v}=, ={:drop-trigger :tr}=, each with
+=:if-exists?= defaulting to =true=.
+
+** Rendering by hand
+
+#+begin_src clojure
+(ddl/render {:create-table :t :columns [[:a :integer {}]] :indexes [[nil [:a] {}]]})
+;; => {:statements ["CREATE TABLE IF NOT EXISTS \"t\" (\"a\" INTEGER) STRICT"
+;;                  "CREATE INDEX IF NOT EXISTS \"t_a_idx\" ON \"t\" (\"a\")"]}
+(ddl/def-kind {:create-index :i :on :t :columns [:a]})   ; => :create-index
+(ddl/def-name {:create-index nil :on :t :columns [:a]})  ; => "t_a_idx"
+(ddl/expected-columns {:create-table :t :columns [[:a :integer {}] [:b :text {}]]})
+;; => [{:name "a" :type "INTEGER"} {:name "b" :type "TEXT"}]   (what migrate! verifies)
+#+end_src
+
+* The query DSL
+
+=sqlite-cljs.dsl= is pure: =(dsl/render q)= ⇒ ={:sql "…" :params […]}=. The execute layer
+calls it for you whenever you pass a map, so most of the time you never see the SQL; call
+=render= directly to inspect, log or test it.
+
+** The render model
+
+- *Maps are statements*: ={:select …}=, ={:insert-into …}=, ={:update …}=,
+  ={:delete-from …}=, ={:union […]}=. A map in an *expression* position is a subquery.
+- *Vectors starting with a keyword are operator or function calls*: =[:= :id 1]=,
+  =[:and …]=, =[:count :*]=, =[:lower :name]=, =[:raw "sql" & params]=.
+- *Keywords are identifiers*, rendered kebab→snake and always quoted: =:user-name= ⇒
+  ="user_name"=, =:u/name= ⇒ ="u"."name"=, =:main.users/id= ⇒ ="main"."users"."id"=, =:*=
+  ⇒ =*=, =:u/*= ⇒ ="u".*=.
+- *Strings in expression positions are values* (bound); *strings in identifier positions*
+  (=:from=, =:columns=, select items, =:set= keys, aliases) are exact identifiers, quoted
+  as one name with no case translation or dot splitting — the way to reach a column that
+  really contains a dot or capital letters.
+- *Every value becomes a =?= parameter* in left-to-right order. Values are never
+  interpolated. =nil= is =NULL=, and =[:= :x nil]= renders ="x" IS NULL= (=[:not= :x nil]=
+  ⇒ =IS NOT NULL=).
+- Bindable values: nil, booleans, numbers, strings, BigInt, Buffer/Uint8Array/ArrayBuffer.
+  A keyword in a value position is an identifier, not a string — use ="pending"= for an
+  enum-like value; a collection or =js/Date= is a =dsl-error= with a hint.
+
+#+begin_src clojure
+(dsl/render {:select [:id :user-name] :from :users :where [:and [:= :active true] [:> :age 18]]})
+;; => {:sql "SELECT \"id\", \"user_name\" FROM \"users\" WHERE (\"active\" = ? AND \"age\" > ?)"
+;;     :params [true 18]}
+#+end_src
+
+(=true= binds as INTEGER 1 at the driver boundary; the renderer leaves values untouched.)
+
+** Select items and the alias rule
+
+Select items are =:col=, ="Exact"=, =[expr :alias]=, =[expr]= or =[:as expr :alias]=. *A
+two-element vector in a select list is always =expr AS alias=* — the honeysql rule — so a
+bare function call needs wrapping, and =[:count :*]= is the one documented exception:
+
+#+begin_src clojure
+{:select [[:email :contact] [[:count :*] :n] [[:lower :name] :lname] [[:lower :name]] [:as [:upper :name] :u]]
+ :from :t}
+;; SELECT "email" AS "contact", count(*) AS "n", lower("name") AS "lname", lower("name"), upper("name") AS "u" FROM "t"
+{:select [[:count :*]] :from :t}          ; SELECT count(*) FROM "t"
+{:select [[:lower :name]] :from :t}       ; SELECT "lower" AS "name" FROM "t"  — the wart, shared with honeysql
+#+end_src
+
+The last form renders an alias pair, and SQLite then fails *loudly* with =no such column:
+lower= (the driver compiles with =SQLITE_DQS=0=, so a misspelled identifier is never
+silently a string literal — inventory 7.12). This is deliberate: a quiet
+rendering-as-you-meant would hide the ambiguity.
+
+Duplicate result names are refused before execution because the driver collapses them
+into one map key (inventory 8.15): ={:select [:u/id :o/id] …}= is a =dsl-error
+{:duplicates ["id"]}=; write =[:u/id :uid] [:o/id :oid]=. Names the renderer cannot see
+(=*=, un-aliased expressions) are not checked. =:distinct? true= renders =SELECT DISTINCT=.
+
+** FROM and joins
+
+#+begin_src clojure
+:from :users                          ; FROM "users"
+:from [:users :u]                     ; FROM "users" AS "u"          (a [table alias] pair is ONE aliased table)
+:from [[:users :u] [:orgs :o]]        ; FROM "users" AS "u", "orgs" AS "o"
+:from [{:select [:id] :from :t} :s]   ; FROM (SELECT "id" FROM "t") AS "s"
+:from [[[:json-each [1 2 3]] :j]]     ; FROM json_each(?) AS "j"    (one JSON-array parameter)
+#+end_src
+
+Joins are an ordered =:joins= vector of =[kind table condition]=, or the honeysql clause
+keys (=:join= / =:inner-join= / =:left-join= / =:right-join= / =:full-join= / =:cross-join=
+with =[table condition table condition …]= pairs), which render after =:joins= in that
+fixed order. A condition is an expression (=ON …=) or =[:using :col …]=; =:cross-join= has
+none, every other kind requires one. =:right-join= / =:full-join= need SQLite ≥ 3.39 and
+are gated when a =:sqlite-version= is given.
+
+#+begin_src clojure
+{:select [[:u/id :uid] :o/name] :from [:users :u]
+ :joins [[:left-join [:orgs :o] [:= :o/id :u/org-id]]
+         [:join :memberships [:using :org-id]]]}
+;; SELECT "u"."id" AS "uid", "o"."name" FROM "users" AS "u" LEFT JOIN "orgs" AS "o" ON "o"."id" = "u"."org_id" INNER JOIN "memberships" USING ("org_id")
+#+end_src
+
+** WHERE: the operator set
+
+| form                                                   | renders                                      | notes                                                        |
+|--------------------------------------------------------+----------------------------------------------+--------------------------------------------------------------|
+| =[:= a b]= =[:not= a b]= =[:<> a b]= =[:!= a b]= =[:< a b]= =[:<= a b]= =[:> a b]= =[:>= a b]= | =a = ?= …           | exactly two arguments; a =nil= side of =:=/:not== becomes =IS [NOT] NULL= |
+| =[:and …]= =[:or …]=                                    | =(a AND b AND c)=                             | empty =:and= ⇒ =1=1=, empty =:or= ⇒ =0=1=, one argument ⇒ itself |
+| =[:not x]=                                             | =NOT (x)=                                    |                                                              |
+| =[:in x coll]= =[:not-in x coll]=                        | =x IN (?, ?, …)=                              | coll: vector, subquery map or =[:json-each coll]=; empty ⇒ =0=1= / =1=1=; > 500 values ⇒ =json_each= |
+| =[:is-null x]= =[:not-null x]= =[:is-not-null x]=          | =x IS NULL= / =x IS NOT NULL=                  |                                                              |
+| =[:is a b]= =[:is-not a b]= =[:is-distinct-from a b]= =[:is-not-distinct-from a b]= | =a IS b= …       |                                                              |
+| =[:like x pat]= =[:not-like …]= =[:glob …]= =[:not-glob …]= =[:regexp …]= =[:not-regexp …]= =[:match …]= | =x LIKE ?= | optional 4th ={:escape "\\"}= ⇒ =ESCAPE ?=; =REGEXP= needs a UDF named =regexp= |
+| =[:between x lo hi]= =[:not-between x lo hi]=             | =x BETWEEN ? AND ?=                           |                                                              |
+| =[:exists q]= =[:not-exists q]=                           | =EXISTS (SELECT …)=                           | =q= is a query map                                            |
+| =[:+ …]= =[:- …]= =[:* …]= =[:/ …]= =[:% …]= =[:|| …]= =[:& …]= =[:| …]= =[:<< …]= =[:>> …]= | =(a + b + c)= | variadic; =[:- x]= ⇒ =-(x)=; =[:-> j path]= / =[:->> j path]= (JSON, ≥ 3.38) |
+| =[:cast x :integer]=                                    | =CAST(x AS INTEGER)=                           | type in =:integer :int :real :text :blob :any :numeric=       |
+| =[:case [c v] [c v] :else v]=                            | =CASE WHEN c THEN v … ELSE v END=              |                                                              |
+| =[:collate x :nocase]=                                  | =x COLLATE NOCASE=                            |                                                              |
+| =[:over [:row-number] {:partition-by [..] :order-by [..]}]= | =row_number() OVER (PARTITION BY … ORDER BY …)= | frames are not supported: use =[:raw]= (inventory 8.9)     |
+| =[:distinct x]=                                         | =DISTINCT x=                                  | inside aggregates: =[:count [:distinct :org-id]]=             |
+| =[:param v]=                                            | =?=                                           | force a value where a vector/keyword would be read otherwise  |
+| =[:raw "sql" & params]=                                  | the text verbatim, params bound               | see [[The :raw hatch]]                                        |
+| =[:json-each coll-or-expr]=                              | =json_each(?)=                                | table-valued; also the forced big-IN path                     |
+| any other keyword                                       | =fn_name(args)=                               | kebab→snake, =[a-z_][a-z0-9_]*= only; =:*= only as the sole argument |
+
+** ORDER BY, GROUP BY, HAVING, LIMIT
+
+#+begin_src clojure
+{:select [[:o/name :org] [[:count :*] :n]]
+ :from [:users :u]
+ :left-join [[:orgs :o] [:= :o/id :u/org-id]]
+ :group-by [:o/name]
+ :having [:> [:count :*] 0]
+ :order-by [[:n :desc] [[:lower :o/name] :asc [:collate :nocase]] :o/id]
+ :limit 10 :offset 20}
+#+end_src
+
+An =:order-by= item is an expression or =[expr & flags]= with flags =:asc :desc
+:nulls-first :nulls-last= or =[:collate :nocase]=; as in select lists the first element of
+a vector item is the expression, so a call is wrapped: =[[:lower :email] :asc]=. =:limit=
+and =:offset= are bound parameters; =:offset= without =:limit= is a =dsl-error= because
+SQLite has no =OFFSET= without =LIMIT= (use =:limit -1= for "no limit").
+
+** CTEs, compounds and subqueries
+
+#+begin_src clojure
+{:with [[:recent {:select [:id] :from :posts :where [:> :created-at 0]}]
+        [[:tree [:id :parent-id]] {:union-all [{:select [:id :parent-id] :from :nodes :where [:= :parent-id nil]}
+                                               {:select [:n/id :n/parent-id] :from [:nodes :n]
+                                                :joins [[:join :tree [:= :tree/id :n/parent-id]]]}]}
+         {:recursive true :materialized false}]]
+ :select [:id] :from :tree}
+;; WITH RECURSIVE "recent" AS (…), "tree"("id", "parent_id") AS NOT MATERIALIZED (… UNION ALL …) SELECT "id" FROM "tree"
+
+{:union [{:select [:id] :from :a} {:select [:id] :from :b}] :order-by [:id] :limit 5}
+;; SELECT "id" FROM "a" UNION SELECT "id" FROM "b" ORDER BY "id" LIMIT ?
+#+end_src
+
+=:with= is a vector of =[name query opts?]= (=[[name [cols]] query opts]= for a column
+list; opts =:recursive= and =:materialized= true/false) or a map ={name query}=.
+Compounds are =:union= / =:union-all= / =:intersect= / =:except= over a vector of at least
+two query maps; =:order-by= / =:limit= / =:offset= go on the compound, never on a member.
+Subqueries are query maps in expression positions: =[:in :org-id {:select [:id] :from
+:orgs :where …}]=, =[:exists {…}]=, =[:> :score {:select [[[:avg :score]]] :from :posts}]=,
+=[{:select …} :alias]= as an aliased select item (a subquery select item must be aliased).
+=:with= is accepted on inserts, updates and deletes as well.
+
+** INSERT
+
+#+begin_src clojure
+{:insert-into :users :values [{:email "a@x" :name "A"} {:email "b@x" :name "B"}]}
+;; INSERT INTO "users" ("email", "name") VALUES (?, ?), (?, ?)
+{:insert-into :users :columns [:email :name] :values [["a@x" "A"] ["b@x" "B"]]}
+{:insert-into :users :columns [:email] :select {:select [:email] :from :staging}}
+{:insert-into :log :default-values true}
+{:insert-into :users :or :ignore :values [{:email "a@x"}]}   ; INSERT OR IGNORE — :rollback :abort :fail :ignore :replace
+#+end_src
+
+Map rows must share one key set (SQLite's =VALUES= has no =DEFAULT= keyword); vector rows
+need =:columns=. =:or :replace= is offered but remember =REPLACE= is a delete plus insert
+(new rowid, FK cascades, unlisted columns reset — inventory 7.11); the upsert below is the
+"update or insert" you usually want.
+
+** UPSERT: =:on-conflict= / =:do-update-set= / =:where= / =:returning=
+
+#+begin_src clojure
+{:insert-into :users :values [{:email "a@x" :name "A" :count 1}]
+ :on-conflict [:email]
+ :do-update-set {:count [:+ :users/count 1] :name :excluded/name}
+ :where [:> :excluded/updated-at :users/updated-at]
+ :returning :*}
+;; INSERT INTO "users" ("email", "name", "count") VALUES (?, ?, ?)
+;; ON CONFLICT ("email") DO UPDATE SET "count" = ("users"."count" + ?), "name" = "excluded"."name"
+;; WHERE "excluded"."updated_at" > "users"."updated_at" RETURNING *
+
+{:insert-into :users :values [{:email "a@x" :name "A"}] :on-conflict [:email] :do-update-set [:name]}
+;; … DO UPDATE SET "name" = "excluded"."name"                       (vector form: col = excluded.col)
+{:insert-into :users :values [{:email "a@x"}] :do-nothing true}
+;; … ON CONFLICT DO NOTHING                                          (target optional)
+{:insert-into :users :values [{:email "a@x"}]
+ :on-conflict [[:email] {:where [:= :active 1]}] :do-update-set [:email]}
+;; … ON CONFLICT ("email") WHERE "active" = ? DO UPDATE SET …       (partial-index target)
+{:insert-into :users :values [{:email "a@x"}]
+ :on-conflict [[[:email] {:do-update-set [:email]}] [[] {:do-nothing true}]]}
+;; … ON CONFLICT ("email") DO UPDATE SET … ON CONFLICT DO NOTHING    (multiple clauses, SQLite >= 3.35)
+#+end_src
+
+On an insert, =:where= is the =DO UPDATE= predicate and needs =:do-update-set=; a
+=[cols {…}]= pair map takes =:where= (the conflict-target predicate), =:update-where=,
+=:do-update-set= and =:do-nothing=. =:returning= is =:*=, one item or a vector of select
+items (aliases allowed) and turns =execute!='s result into rows. Two SQLite rules worth
+knowing: =ON CONFLICT= fires only for UNIQUE / PRIMARY KEY conflicts — NOT NULL, CHECK and
+FK failures still raise (inventory 7.15); and an =INSERT … SELECT= with an upsert gets
+=WHERE true= appended to the select when it has no =:where=, resolving SQLite's parsing
+ambiguity with =ON=.
+
+** UPDATE and DELETE
+
+#+begin_src clojure
+{:update :users :set {:name "x" :age [:+ :age 1] :updated-at [:raw "unixepoch('subsec')*1000"]}
+ :where [:= :id 42] :returning [:id :name]}
+;; UPDATE "users" SET "name" = ?, "age" = ("age" + ?), "updated_at" = unixepoch('subsec')*1000 WHERE "id" = ? RETURNING "id", "name"
+{:update :users :set {:org-id :o/id} :from [:orgs :o] :where [:= :o/name :users/org-name]}   ; UPDATE … FROM
+{:delete-from :posts :where [:< :score 0] :order-by [:id] :limit 100}
+{:delete-from :posts :all? true}
+#+end_src
+
+=:set= is a map ={col expr}= or a vector of =[col expr]= pairs (ordered). A =:where=-less
+=:update= / =:delete-from= is a =dsl-error= unless =:all? true= (inventory 7.8). =:order-by=
+/ =:limit= on writes use the driver's =ENABLE_UPDATE_DELETE_LIMIT= build and render after
+=RETURNING= (the only order SQLite parses — inventory 0b).
+
+** The =:raw= hatch
+
+=[:raw "sql" & params]= inlines the string verbatim and binds its parameters:
+
+#+begin_src clojure
+{:select [[[:raw "strftime('%Y', created_at / 1000, 'unixepoch')"] :year]] :from :posts
+ :where [:raw "rowid % ? = 0" 7]}
+#+end_src
+
+The text is *your* SQL: identifiers inside it are not quoted and values inside it are not
+parameters unless you write =?= and pass them. Use it for window frames, SQLite-specific
+functions the grammar lacks and DDL defaults (=[:raw "(unixepoch('subsec') * 1000)"]=).
+In DDL literal mode a =[:raw]= with parameters is refused.
+
+** Literal mode
+
+DDL expressions (=:check=, =:default=, view queries, partial-index =:where=, trigger
+bodies) cannot take parameters, so =ddl= renders them with ={:mode :literal}=: numbers,
+booleans (=1= / =0=), =nil= (=NULL=) and strings (single-quoted with ='= doubled) are
+inlined; BigInt beyond 2^53, NaN, Buffers, =json_each= lists and =[:raw]= parameters are
+refused (inventory 6.3.9). =(dsl/render-literal expr)= gives you the string;
+=(dsl/render q {:mode :literal})= renders a whole statement without =:params=.
+
+** Big IN lists and bulk inserts
+
+SQLite allows 32766 bound parameters per statement (inventory 5.9). Two mechanisms keep
+you clear of the limit without thinking about it:
+
+- *=json_each= for IN lists.* =[:in :id coll]= with more than 500 values
+  (=:in-json-threshold=) renders ="id" IN (SELECT value FROM json_each(?))= with *one*
+  JSON-array parameter (numbers, strings, booleans as 1/0, nil); =[:in :id [:json-each
+  coll]]= forces the path for any size. Verified live over 700 values.
+- *Chunked bulk inserts.* =query/execute!= renders a DSL insert with
+  =dsl/render-chunked=: rows are split into statements that each fit =:max-params=
+  (default 32766), executed inside one =IMMEDIATE= transaction unless one is already
+  active, with =:changes= summed and =RETURNING= rows concatenated; a failing chunk rolls
+  back the whole insert. Rows are never split (a row wider than the limit is a
+  =dsl-error=). Pass ={:max-params 50}= to exercise the path in tests; the smoke inserts
+  1000 rows in 40 chunks that way.
+
+A single statement rendered above =:max-params= is a =dsl-error= pointing at
+=render-chunked=.
+
+* migrate!
+
+=(migrate/migrate! d defs opts)= takes an *ordered vector of DDL definition maps* and
+brings the database up to them, creating what is absent and leaving what exists alone.
+It is idempotent: run it at every start.
+
+** The desired-shape contract
+
+Each =:create-table= def describes the shape the table *should* have. After every def has
+been applied, each table def is verified against =PRAGMA table_xinfo=: a declared column
+that is missing, or whose declared type differs, is *drift*, and the whole run rejects —
+rolling everything back — with
+
+#+begin_src clojure
+{:type :sqlite-cljs/migration-error :reason :drift :table :users
+ :missing ["nickname"] :type-mismatch [{:column "name" :expected "INTEGER" :actual "TEXT"}]}
+#+end_src
+
+Nothing is altered automatically. *Extra* columns in the database are allowed (dropping
+a column from a def is tolerated, verified live), so the rule is: the def is a lower
+bound on the table, checked column by column and type by type.
+
+Per definition kind:
+
+| kind                                              | absent                                | present                                                              |
+|---------------------------------------------------+---------------------------------------+----------------------------------------------------------------------|
+| =:create-table=                                   | created with its =:indexes=            | reported =:existing=; its =:indexes= are still created when absent; verified for drift afterwards; a view/index of that name ⇒ =:name-clash= |
+| =:create-index= / =:create-view= / =:create-trigger= | created                                | =:existing= (by name in =sqlite_master=)                              |
+| =:alter-table=                                    | applied when its effect is not yet there | =:existing= when it is (see below)                                   |
+| =:drop-*=                                         | =:existing=                            | dropped, reported =:dropped=                                          |
+
+An =:alter-table= is applied only when needed — =:add-column= when the column is missing,
+=:rename-column= / =:rename-to= when the old name still exists and the new one does not,
+=:drop-column= when the column exists, =:alter-column= always — so re-running is a no-op.
+A =:rename-to= whose source table is absent is skipped (a fresh database creates the
+renamed table directly); any other alter on a missing table is =:reason :no-such-table=.
+
+** Evolving a schema: explicit alters, renames first
+
+Keep the table def describing the *desired* shape and add explicit alters that bring
+existing databases there. A fresh database gets the new shape from =CREATE TABLE= and
+skips the alters; an old database applies them; both verify clean:
+
+#+begin_src clojure
+(def schema-v2
+  [{:alter-table :orgs :rename-to :organisations}          ; renames go BEFORE the renamed def
+   {:create-table :organisations :columns [[:id :integer {:primary-key? true}] [:name :text {:not-null? true :unique? true}]]}
+   {:create-table :users
+    :columns [[:id :integer {:primary-key? true}]
+              [:mail :text {:not-null? true}]
+              [:org-id :integer {:references {:table :organisations :column :id}}]
+              [:nickname :text {:not-null? true :default ""}]]
+    :indexes [[:users-org-idx [:org-id]]]}
+   {:alter-table :users :add-column [:nickname :text {:not-null? true :default ""}]}
+   {:alter-table :users :rename-column [:email :mail]}
+   {:create-index :users-mail-idx :on :users :columns [:mail]}
+   {:drop-view :active-users}])
+#+end_src
+
+Order matters twice: a rename precedes the def of the renamed table (otherwise the def
+creates a fresh empty table and the rename then finds its target taken), and a
+=:rename-column= that a later index depends on precedes that index. The smoke runs
+exactly this pattern: a def gaining =:nickname= is drift until the matching
+=:add-column= def is added, after which the run reports =:altered [:users]= and the next
+run reports nothing altered.
+
+** Errors
+
+| =:reason=          | when                                                                                                  |
+|--------------------+-------------------------------------------------------------------------------------------------------|
+| =:invalid-defs=    | =validate= found a def that does not render (=:problems [{:index :problem}]=)                            |
+| =:drift=           | a table def's column is missing or has another type; also =:missing-table true= when a later alter renamed the table away |
+| =:database-newer=  | =PRAGMA user_version= is above =(count defs)=: the code is older than the database                     |
+| =:name-clash=      | a =:create-table= name exists as a view/index/trigger                                                  |
+| =:no-such-table=   | an alter (other than =:rename-to=) on a missing table                                                  |
+| =:statement-failed= | SQLite refused a statement: =:index i :def … :code "SQLITE_…" :cause <sqlite-error>=                 |
+| =:bad-def=         | not a DDL definition                                                                                  |
+
+Everything runs in *one =BEGIN IMMEDIATE= transaction* (DDL is transactional in SQLite):
+a failure leaves schema and =user_version= untouched, verified live after three rejected
+runs.
+
+** =user_version= as a fingerprint, =:allow-newer?=, =:log=
+
+After a successful run =PRAGMA user_version= is set to =(count defs)= — a cheap fingerprint
+of "how many definitions this database has been brought up to", *not* a migration cursor:
+every run re-checks every definition. If the stored version is greater than the number
+of defs given, the code is older than the database and =migrate!= rejects with
+=:database-newer= unless =:allow-newer? true=. =:log= is a function of one string called
+per applied definition (="migrate! create-table :users"=).
+
+The report resolves to
+
+#+begin_src clojure
+{:created [:orgs :users :users-org-idx] :existing [] :altered [] :dropped []
+ :user-version 3 :previous-user-version 0 :sqlite-version "3.53.4"}
+#+end_src
+
+and the statement cache is cleared afterwards (inventory 7.17).
+
+** =status!= and =validate=
+
+#+begin_src clojure
+(migrate/status! d)
+;; => {:user-version 3 :schema-version 12 :tables ["orgs" "users"] :views ["active_users"]
+;;     :indexes ["users_org_idx"] :triggers []}          (sqlite_* internal names are hidden)
+(migrate/validate defs)   ; pure => [] or [{:index 2 :problem "column :on: there is no BOOLEAN type; …" :error e}]
+#+end_src
+
+* Executing queries
+
+=sqlite-cljs.query= runs *query designators* against a db value:
+
+| designator                    | example                                              |
+|-------------------------------+------------------------------------------------------|
+| a DSL map                     | ={:select [:id] :from :users :where [:= :id 1]}=      |
+| ={:sql :params}=              | ={:sql "SELECT ?" :params [1]}=                       |
+| =[sql & params]=              | =["SELECT * FROM users WHERE id = ?" 1]=              |
+| a SQL string                  | ="SELECT count(*) AS n FROM users"=                   |
+
+=(query/->statement q opts)= is the pure normaliser (=:in-json-threshold=, =:max-params=,
+=:sqlite-version= are forwarded to the renderer). In raw forms a keyword parameter binds
+as its name.
+
+** The functions
+
+#+begin_src clojure
+(q/query-all! d q opts)    ; => [row ...]                       vector of kebab-keyed maps
+(q/query-one! d q opts)    ; => row or nil                      first row
+(q/query-value! d q opts)  ; => value or nil                    first column of the first row: {:select [[[:count :*] :n]] ...}
+(q/execute! d q opts)      ; => {:changes n :last-insert-rowid n} or, with RETURNING, [row ...]
+(q/execute-all! d qs opts) ; => [result ...]                    a vector of designators (DDL maps included) in one IMMEDIATE transaction
+(q/exec! d sql-or-vec)     ; => nil                             parameter-less SQL (several statements allowed), strings or DDL maps; clears the cache
+(q/transact! d f) (q/transact! d mode f)                        see Transactions
+(q/clear-cache! d)         ; => nil
+#+end_src
+
+All resolve to promesa promises. =execute!= runs any statement: a reader (SELECT or a
+write with =RETURNING=) resolves to rows, anything else to the change count and
+=lastInsertRowid= — which is meaningless for =WITHOUT ROWID= tables and non-INTEGER keys
+(inventory 7.16), so prefer =:returning [:id]=. =exec!= is for migrations-by-hand, seeds
+and pragma batches: it is the one entry that accepts several statements in one string,
+and it never takes parameters. A parameterised string with two statements is refused
+with =argument-error {:reason :multiple-statements}=.
+
+** Rows: kebab keys, raw values, =:coerce=
+
+Row maps have kebab keyword keys (=user_name= ⇒ =:user-name=; the result name of =:u/email=
+is =:email=, of =[:u/name :user]= is =:user=). Values are SQLite's storage classes as the
+driver returns them — INTEGER ⇒ number (BigInt under =:safe-integers?=), REAL ⇒ number,
+TEXT ⇒ string, BLOB ⇒ Buffer, NULL ⇒ nil. No boolean or date reconstruction happens
+unless you ask per query (inventory 8.4):
+
+#+begin_src clojure
+(q/query-one! d {:select [:id :active :created-at :prefs] :from :users :where [:= :id 1]}
+              {:coerce {:active :boolean :created-at :date :prefs :json :kind :keyword}})
+;; => {:id 1 :active true :created-at #inst "2026-09-25T00:41:17.444-00:00" :prefs {:theme "dark"}}
+#+end_src
+
+=:coerce= kinds: =:boolean= (0/1 ⇒ false/true), =:date= (epoch ms ⇒ =js/Date=), =:number=
+(BigInt ⇒ number, throwing above 2^53), =:bigint=, =:json= (TEXT ⇒ keywordized data),
+=:keyword=, or any one-argument function. NULL is never coerced. =core/coerce-row= applies
+the same map to a single row you already have.
+
+** The statement cache
+
+Prepared statements are cached per connection in a 128-entry LRU keyed on the exact SQL
+text (=:cache-size= to change). The same DSL map renders the same text, so a hot query is
+prepared once; a query whose *values* differ still hits (they are parameters), a query
+whose *text* differs (a different =IN= list length, a =[:raw]= that embeds a number) is a
+new entry. =exec!= and =migrate!= clear the cache because DDL may have changed what a
+statement means (inventory 7.17); =close!= clears it too. Inspect with =core/cache-size=,
+=core/cached?= and =query/clear-cache!=. Verified live: 200 runs of one query keep one
+entry; 140 distinct texts cap at 128 with the oldest evicted; =exec!= empties it.
+
+* Transactions
+
+#+begin_src clojure
+(p/let [ids (q/transact! d (fn [tx]
+                             (let [org  @(q/execute! tx {:insert-into :orgs :values [{:name "initech"}] :returning [:id]})
+                                   user @(q/execute! tx {:insert-into :users
+                                                         :values [{:email "p@initech" :name "Peter" :active true
+                                                                   :org-id (:id (first org))}]
+                                                         :returning [:id]})]
+                               {:org (:id (first org)) :user (:id (first user))})))]
+  ids)
+;; => {:org 3 :user 5}
+#+end_src
+
+=(transact! d f)= runs =(f tx)= — =tx= is the same db value — inside =BEGIN IMMEDIATE …
+COMMIT=; =(transact! d :deferred f)= / =:exclusive= choose the mode. The value the body
+returns becomes the resolved value.
+
+- *The body runs synchronously.* The driver is synchronous, so every promise returned by
+  =execute!= / =query-all!= inside the body is already settled: deref it (=@=) to get the
+  value. A rejected promise *throws on deref*, and any throw rolls the transaction back
+  and rejects =transact!= with that error — the smoke shows a =SQLITE_CONSTRAINT_FOREIGNKEY=
+  deref undoing the row inserted before it, and a plain =(throw (ex-info "boom" …))=
+  undoing two.
+- *A body that returns a promise is rejected* with =argument-error {:reason :async-body}=
+  and rolled back: the transaction would otherwise have committed before the first
+  continuation ran. Return plain values.
+- *Nested =transact!= is rejected* with =argument-error {:reason :nested-transaction}=
+  (the driver's savepoint nesting is deliberately not exposed, inventory 7.6); the outer
+  transaction is unaffected and commits if the body handles the rejection.
+- =execute!= with chunked inserts and =execute-all!= open their own =IMMEDIATE= transaction
+  only when none is active, so they compose inside a =transact!= body.
+
+** Why =IMMEDIATE= by default
+
+A =DEFERRED= transaction takes its write lock at the first write; in WAL mode a
+transaction that read, then writes after another connection committed, fails at once with
+=SQLITE_BUSY_SNAPSHOT= — no waiting (inventory 8.17). =BEGIN IMMEDIATE= takes the lock up
+front, so a second writer simply waits =busy_timeout= (5000 ms by default) and then gets
+a plain =SQLITE_BUSY= that =util/busy-error?= recognises. Use =:deferred= for read-only
+bodies that must see one consistent snapshot, =:exclusive= when readers must be kept out
+as well (rarely, and never in WAL mode where it behaves like =IMMEDIATE=).
+
+* Value binding
+
+Every value passes through =core/->param= on the way to the driver (inventory 5.7, 7.5):
+
+| ClojureScript value                       | bound as                                  | note                                                        |
+|-------------------------------------------+-------------------------------------------+-------------------------------------------------------------|
+| =nil=                                     | NULL                                      |                                                             |
+| =true= / =false=                          | INTEGER 1 / 0                             | read back as =1= / =0= unless =:coerce {:col :boolean}=       |
+| integral number within ±2^53−1            | INTEGER (converted to BigInt internally)  | the driver would otherwise bind every JS number as REAL and store ="5.0"= in TEXT / =ANY= columns |
+| other finite number                       | REAL                                      |                                                             |
+| =NaN= / =±Infinity=                       | =argument-error {:reason :nan / :infinity}= | not JSON-serialisable, compares oddly (inventory 8.5)       |
+| integral number beyond 2^53−1             | =argument-error {:reason :unsafe-integer}= | pass a BigInt                                               |
+| BigInt                                    | INTEGER, exact                            |                                                             |
+| string                                    | TEXT                                      | a NUL character is =argument-error {:reason :nul}= (inventory 7.13) |
+| keyword (raw =[sql & params]= / ={:sql :params}= only) | TEXT, its name                | in the DSL a keyword is always an identifier                 |
+| Buffer / Uint8Array / ArrayBuffer / typed array | BLOB                                 | read back as Buffer                                         |
+| =js/Date=                                 | =argument-error {:reason :date}=           | store =(.getTime d)= in an INTEGER column (house default) or an ISO string |
+| collection / symbol / other object        | =argument-error {:reason :collection / :unbindable-value}= | serialise first                               |
+
+** Booleans and dates end to end
+
+#+begin_src clojure
+(p/let [_   (q/execute! d {:insert-into :users
+                           :values [{:email "dee@globex" :name "Dee" :active false :org-id 2
+                                     :created-at (.getTime (js/Date.))}]})
+        raw (q/query-one! d {:select [:active :created-at] :from :users :where [:= :email "dee@globex"]})
+        row (q/query-one! d {:select [:active :created-at] :from :users :where [:= :email "dee@globex"]}
+                         {:coerce {:active :boolean :created-at :date}})
+        off (q/query-all! d {:select [:email] :from :users :where [:= :active false]})]
+  [raw row off])
+;; => [{:active 0 :created-at 1790210477444}
+;;     {:active false :created-at #inst "2026-09-24T00:41:17.444-00:00"}
+;;     [{:email "cy@globex"} {:email "dee@globex"}]]
+#+end_src
+
+=[:= :active false]= binds =0=, so a boolean predicate works without thinking about the
+storage. A =:default [:raw "(unixepoch('subsec') * 1000)"]= yields the same epoch
+milliseconds SQLite-side (verified live within the same second).
+
+** Integers beyond 2^53: =:safe-integers?=
+
+By default INTEGER columns read as JS numbers; values beyond ±2^53 would be rounded
+silently by the driver. =:safe-integers? true= on =db= (or per query in opts) reads INTEGER
+as BigInt — =lastInsertRowid= follows the same switch — and =core/bigint->number=
+converts back when safe (throwing =:unsafe-integer= otherwise). Rowids and counters are
+far below the cliff, which is why the default is off (inventory 7.5).
+
+#+begin_src clojure
+(p/let [r (q/query-one! d ["SELECT 9007199254740993 AS big"] {:safe-integers? true})]
+  [(core/bigint?* (:big r)) (str (:big r))])
+;; => [true "9007199254740993"]
+#+end_src
+
+** Blobs
+
+Pass a Buffer or =Uint8Array=; a BLOB comes back as a Node Buffer. The DSL binds it like
+any value; in DDL literal mode blobs are refused.
+
+* Error handling
+
+Every rejection (and every synchronous throw from =db=, the renderers and =->param=) is an
+=ex-info= whose data carries =:type=:
+
+| =:type=                          | when                                                                      | data                                                        |
+|----------------------------------+---------------------------------------------------------------------------+-------------------------------------------------------------|
+| =:sqlite-cljs/sqlite-error=      | SQLite refused something at run time                                      | =:code "SQLITE_…"= (extended result code string), =:message=, =:sql=, =:cause= |
+| =:sqlite-cljs/argument-error=    | a bad argument caught by the library or the driver (before or at binding) | =:reason=, often =:value= / =:column= / =:sql=                 |
+| =:sqlite-cljs/dsl-error=         | the renderer refused a statement or definition form                       | =:form= (the offending form), sometimes =:duplicates= / =:requires= |
+| =:sqlite-cljs/config-error=      | =db= options, driver loading, journal mode unavailable                     | =:reason :bad-options / :open-failed / :driver-missing / :journal-mode-unavailable= |
+| =:sqlite-cljs/migration-error=   | =migrate!= (see [[migrate!]])                                              | =:reason=, =:table=, =:missing=, =:type-mismatch=, =:index=, =:code=, =:cause= |
+
+Helpers in =sqlite-cljs.util=: =error-data= (the map, or nil for a foreign error),
+=error-type=, =sqlite-code=, =constraint-error?= (code starts with =SQLITE_CONSTRAINT=),
+=busy-error?= (starts with =SQLITE_BUSY=), and the constant =error-types=.
+
+** SQLite codes seen live
+
+| code                            | cause                                                          |
+|---------------------------------+----------------------------------------------------------------|
+| =SQLITE_CONSTRAINT_UNIQUE=      | duplicate in a UNIQUE / PRIMARY KEY column                     |
+| =SQLITE_CONSTRAINT_FOREIGNKEY=  | child row without a parent (=foreign_keys= is on)              |
+| =SQLITE_CONSTRAINT_NOTNULL=     | NULL into a NOT NULL column                                    |
+| =SQLITE_CONSTRAINT_DATATYPE=    | a STRICT table refusing a mistyped value                       |
+| =SQLITE_CONSTRAINT_CHECK=       | a CHECK failed                                                 |
+| =SQLITE_ERROR=                  | syntax error, no such table / column (a hostile identifier ends here) |
+| =SQLITE_READONLY=               | a write on a =:readonly?= connection                           |
+| =SQLITE_CANTOPEN=               | =:file-must-exist?= on a missing file, unopenable path         |
+| =SQLITE_BUSY=                   | another connection held the write lock past =busy_timeout=      |
+
+** Argument-error reasons
+
+=:closed= (db value already closed), =:multiple-statements= (a parameterised string with
+two statements), =:not-a-reader=, =:parameter-count= (=["SELECT ?" 1 2]=),
+=:unbindable-value=, =:value-too-big=, =:nan=, =:infinity=, =:unsafe-integer=, =:nul=,
+=:date=, =:collection=, =:nested-transaction=, =:async-body=, =:bad-mode=, =:not-sql=,
+=:not-a-db=, =:too-many-parameters=, =:coerce=, and the DDL validation reasons
+=:unknown-type=, =:strict-type=, =:missing-type=, =:autoincrement=, =:generated=,
+=:add-column=, =:primary-key=, =:without-rowid= (each with =:column=).
+
+** Branching on errors, busy retries
+
+#+begin_src clojure
+(-> (q/execute! d {:insert-into :orgs :values [{:name "acme"}]})
+    (p/catch (fn [e]
+               (case (util/sqlite-code e)
+                 "SQLITE_CONSTRAINT_UNIQUE" :already-there
+                 (throw e)))))
+
+(defn with-busy-retry
+  "Runs (thunk) and retries up to `attempts` times on SQLITE_BUSY with a short backoff."
+  [thunk attempts]
+  (-> (thunk)
+      (p/catch (fn [e]
+                 (if (and (util/busy-error? e) (pos? attempts))
+                   (p/let [_ (p/delay 50)] (with-busy-retry thunk (dec attempts)))
+                   (throw e))))))
+
+(with-busy-retry #(q/transact! d (fn [tx] @(q/execute! tx {:update :counters :set {:n [:+ :n 1]} :where [:= :id 1]}))) 3)
+#+end_src
+
+Busy guidance: within one process use *one* db value per database (the driver
+serialises calls, so there is nothing to race); across processes WAL plus the default
+5000 ms =busy_timeout= absorbs ordinary contention and =busy-error?= is the signal to
+retry the whole =transact!= (never a single statement inside it — the transaction has
+already rolled back). =SQLITE_BUSY_SNAPSHOT= is avoided by the =IMMEDIATE= default; if you
+opt into =:deferred= and see it, retry the same way.
+
+* Design decisions
+
+- *STRICT tables by default.* SQLite's flexible typing means =BOOLEAN= is NUMERIC
+  affinity and a text value slides into an INTEGER column unnoticed. STRICT makes type
+  mistakes fail at write time (=SQLITE_CONSTRAINT_DATATYPE=, verified live) and forces the
+  vocabulary down to what SQLite actually stores (inventory 3.3, 7.1). The escape is per
+  table (=:strict? false=) and explicit (=[:raw "VARCHAR(255)"]=), so a legacy schema is a
+  visible decision rather than the default.
+- *No =:boolean=, no =:datetime=.* Rather than invent column types the engine does not
+  have and then reconstruct values on read, the library states the two house conventions
+  (INTEGER 0/1, INTEGER epoch milliseconds) and refuses the names with a message that
+  says what to use. Reads stay raw; =:coerce= is the explicit, per-query opt-in
+  (inventory 8.4 option b) so a row never surprises you with a =js/Date= you did not ask
+  for.
+- *Integral numbers bind as INTEGER.* The driver binds every JS number as REAL; =5= would
+  become ='5.0'= in a TEXT column and REAL in an =ANY= column, and =typeof()= would lie
+  (inventory 7.5). Converting integral numbers to BigInt before binding costs a check per
+  value and buys exactness; the 2^53 cliff is a loud =:unsafe-integer= error instead of a
+  rounded id.
+- *=:code= strings, not numbers.* SQLite's extended result codes are what the driver
+  reports (="SQLITE_CONSTRAINT_UNIQUE"=), they are self-describing in a log, and
+  =constraint-error?= / =busy-error?= are prefix tests on them. A numeric enum would need
+  a table nobody reads.
+- *Identifiers always quoted, values always bound.* The renderer has exactly one path for
+  identifiers (=util/sql-ident=: double quotes, embedded quotes doubled) and one for values
+  (=?=); there is no "trusted string" mode in DML. The smoke stores ="Robert'); DROP TABLE
+  users;--"= and reads it back verbatim, and renders a hostile =:from= as an inert quoted
+  name that fails with =no such table=. Literal mode exists only because SQLite forbids
+  parameters in DDL expressions, and it inlines a restricted vocabulary through
+  =sql-string-literal=.
+- *The alias rule fails loudly.* A two-element vector in a select list is =[expr alias]=,
+  as in honeysql; =[:lower :name]= renders =lower AS name= and SQLite rejects it because the
+  driver disables double-quoted string literals. Guessing "you meant a function call"
+  would make =[:email :contact]= ambiguous; the one exception (=[:count :*]=) is the form
+  that cannot be an alias.
+- *=migrate!= is a desired-shape apply, not an up/down runner.* A versioned migration
+  list makes the code describe *history* while the table def describes the *present*, and
+  the two drift apart silently. Here the table def is the single source of truth, alters
+  are explicit steps that exist to bring old databases forward, both are idempotent, and a
+  database that disagrees with its def is an error rather than an assumption.
+  =user_version= is a fingerprint that catches "old code, new database"; it is not a
+  cursor, so nothing is ever skipped (inventory 6.4).
+- *Nested =transact!= is an error.* The driver could turn nested calls into SAVEPOINTs,
+  but a savepoint rollback inside a caller's transaction is a semantic the caller did not
+  ask for. Rejecting makes the transaction boundary visible at the call site (inventory
+  7.6).
+- *A synchronous driver behind promises.* better-sqlite3 is synchronous and faster for
+  it (inventory 1.4); the promise API is kept so call sites read like the other house
+  clients and so an asynchronous driver (=node:sqlite= once it settles, or a worker-thread
+  binding) can be swapped in without touching them. The cost is one rule — =transact!=
+  bodies deref settled promises and return plain values — enforced by the =:async-body=
+  rejection.
+- *One connection, =IMMEDIATE=, =busy_timeout= 5000.* SQLite has one writer at a time and
+  the driver is single-threaded, so a pool buys nothing in-process; across processes WAL
+  plus a busy timeout is the documented model, and =IMMEDIATE= avoids the un-retryable
+  =SQLITE_BUSY_SNAPSHOT= (inventory 7.6, 8.17).
+- *Effective values are reported, not assumed.* =journal_mode= and =synchronous= are what
+  SQLite answers, and a WAL request that was not honoured is an error by default: a
+  service that believes it runs WAL on a network share would be wrong about its own
+  durability and concurrency (inventory 7.9, 8.16).
+- *=json_each= over parameter lists past 500.* A 2000-element =IN= list is 2000
+  parameters and a 2000-entry statement cache key; one JSON array is one parameter and one
+  cache entry, and SQLite's =json_each= is fast. The threshold is an option, and
+  =[:json-each]= forces the path (inventory 8.14).
+- *Statement cache keyed on SQL text, cleared on DDL.* The driver recompiles a cached
+  statement after =ALTER TABLE= but its column metadata lags (inventory 7.17); clearing on
+  =exec!= / =migrate!= is cheap and removes the question.
+
+* Testing and the live smoke
+
+#+begin_src bash
+npm install
+./run-tests.sh                                          # cljs.test suite: 88 tests / 560 assertions, no network; exit status reflects pass/fail
+npx shadow-cljs watch node-test                         # re-runs the suite on every change (autorun)
+npx shadow-cljs compile smoke && node target/smoke.js   # LIVE smoke: real file database in a temp dir + :memory:, 11 sections, no network
+#+end_src
+
+- *=run-tests.sh=* compiles the =:node-test= build with autorun disabled (shadow does not
+  propagate the autorun exit status) and =exec=s =node target/node-test.js= — nothing
+  placed after that line in the script would run, so never chain it mid-command inside
+  the script. The suite (=test/sqlite_cljs/=) uses =:memory:= databases plus one temporary
+  file under =target/= for WAL / read-only / =SQLITE_BUSY= with two connections. It covers:
+  kebab/snake translation, identifier quoting with injection strings, row conversion, the
+  error constructors and version compare (=util_test=); the db lifecycle, every
+  construction failure, effective pragmas, =pragma= / =pragma!=, value binding for every
+  type in the table above, BigInt reads, UDFs, error mapping (=core_test=); every
+  designator, rows and =:coerce=, =execute!= results, chunked bulk inserts (a small
+  =:max-params= override plus one real 36 000-parameter insert), =json_each= IN lists,
+  =exec!= / =execute-all!=, transactions — commit, rollback on throw and on a rejected
+  deref, nested rejection, async-body rejection — and the statement-cache LRU
+  (=query_test=); golden SQL for every DDL shape, STRICT rejections with =:column=, the
+  =ADD COLUMN= rules and version gates (=ddl_test=); golden SQL for every DML shape,
+  operators, joins, CTEs, compounds, upserts, =RETURNING=, literal mode, chunking and
+  every rejected form with its =:form= (=dsl_test=); =migrate!= create / idempotent re-run /
+  drift / alter evolution / =user_version= guard / =status!= (=migrate_test=).
+- *REPL*: =npx shadow-cljs watch dev= (terminal 1), =node target/dev.js= (terminal 2),
+  =npx shadow-cljs cljs-repl dev= (terminal 3). The shadow Node REPL does not await
+  promises, but every sqlite-cljs promise is already settled: =@(q/query-all! d q)= works
+  directly.
+- =shadow-cljs.edn= is standalone (declares =funcool/promesa= itself) so =npx shadow-cljs …=
+  only needs Java and =node_modules=; =deps.edn= mirrors the dependencies for consumers.
+  Builds: =:node-test=, =:dev=, =:smoke=.
+- Probe scripts from phase 1 (=dev/probe-bs3.js=, =dev/probe-edge.js=) are the raw
+  driver experiments behind the inventory's =[LOCAL]= tags; they are not part of any build.
+
+** The live smoke
+
+=dev/sqlite_cljs/smoke.cljs= is the phase-4 live verification: the whole library against a
+real file database created with =mkdtemp= under the OS temp directory (=db.sqlite=, removed
+at the end together with its WAL files) plus a =:memory:= database opened side by side.
+There is no network anywhere. Sections run in order and never abort early: each prints
+=PASS <name> — <detail>= or =FAIL <name>: <reason>=, a tally comes last, and the exit code
+is 0 only when every section passed.
+
+| #  | section                                        | what it proves                                                                                                                       |
+|----+------------------------------------------------+--------------------------------------------------------------------------------------------------------------------------------------|
+| 0  | open file + =:memory:= db                        | the file exists, driver and SQLite versions, effective pragmas (WAL, =foreign_keys= on, =synchronous=, busy timeout) on both databases |
+| 1  | =migrate!= + idempotent re-run                   | three tables with FKs, an index and a view created in order; the second run reports everything =:existing=; =user_version= = count; =status!= |
+| 2  | DSL inserts, upsert, join                        | multi-row =VALUES= with =RETURNING=; =ON CONFLICT DO UPDATE SET … WHERE … RETURNING= updating through a NOCASE collation; join + where + order + limit; group-by/having |
+| 3  | transactions                                     | committed work visible; a throwing body rolls back; a rejected deref rolls back; nested =transact!= rejected while the outer commits; a promise-returning body rejected |
+| 4  | booleans + dates                                 | =false= ⇒ =0=, epoch ms ⇒ INTEGER; =:coerce= restores =false= and =js/Date=; =[:= :active false]= filters; the =unixepoch= DEFAULT; =js/Date= refused |
+| 5  | bulk insert                                      | 1000 rows in 40 chunks at =:max-params 50=, count and sum match; 1000 rows in one statement; a failing chunk rolls back the whole insert; =json_each= IN over 700 values |
+| 6  | drift + =user_version= guard                     | a column dropped from a def is tolerated; a type change and an added column are =:drift= with the exact data; the explicit =:add-column= applies once; fewer defs ⇒ =:database-newer=, =:allow-newer?= proceeds |
+| 7  | injection safety                                 | ="Robert'); DROP TABLE users;--"= stored and read verbatim through the DSL and raw =?=; a hostile =:from= renders as an inert quoted name; tables intact |
+| 8  | statement cache                                  | 200 runs of one query keep one cached entry; 140 distinct texts cap at 128 with LRU eviction; =exec!= clears                       |
+| 9  | STRICT mode                                      | =:boolean= / =:datetime= / =[:raw]= under STRICT refused with =:column=; =:integer= 0/1 with CHECK works and SQLite enforces both; a =:strict? false= legacy table with =VARCHAR(255)= works and verifies clean |
+| 10 | error taxonomy                                   | seven =SQLITE_*= codes, six =argument-error= reasons, =dsl-error= with =:form=, =config-error=, a read-only connection, =:file-must-exist?= |
+
+* API reference
+
+One row per public function or constant: name, arguments, one line. Functions taking the
+db value return a promesa promise unless marked *sync*; pure helpers (no I/O) are marked
+*pure*. Names ending in =*= are synchronous internals used by =query= / =migrate=. Every
+name below exists in =src/= (checked by script when this manual was written).
+
+** =sqlite-cljs.core=
+
+| fn                                                 | what                                                                                                            |
+|----------------------------------------------------+-----------------------------------------------------------------------------------------------------------------|
+| =db []= / =[path-or-opts]=                          | *sync* constructor ⇒ db value; opts =:path :memory? :readonly? :file-must-exist? :timeout-ms :safe-integers? :foreign-keys? :journal-mode :require-journal-mode? :synchronous :trusted-schema? :cache-size= |
+| =close! [d]= / =[d {:optimize?}]=                   | closes (idempotent), clears the cache; =:optimize? true= runs =PRAGMA optimize=                                  |
+| =open? [d]= / =in-transaction? [d]=                 | *sync* predicates                                                                                               |
+| =pragma [d name]= / =[d name {:arg :rows?}]=        | read a PRAGMA: first value, or all rows with =:rows? true=                                                       |
+| =pragma! [d name value]=                           | set a PRAGMA (validated bare word / integer / boolean / keyword) and resolve to the re-read value                |
+| =user-version [d]=                                 | =PRAGMA user_version=                                                                                            |
+| =sqlite-version [d]= / =library-version [d]=        | ="3.53.4"= / ="13.0.3"=                                                                                          |
+| =driver-info [d]=                                  | ={:driver :driver-version :sqlite-version :path :memory? :readonly? :open? :effective}=                          |
+| =define-function! [d name f]= / =[d name f {:deterministic? :direct-only? :varargs?}]= | scalar UDF                                                                  |
+| =->param [v]= / =->params [coll]=                   | *pure* value ⇒ driver value / vector ⇒ JS array (count checked against =max-params=)                             |
+| =bigint->number [v]= / =bigint?* [v]=              | *pure* BigInt ⇒ number when safe (=:unsafe-integer= otherwise) / BigInt predicate                                |
+| =coerce-row [coerce row]=                          | *pure* apply a =:coerce= map (=:boolean :date :number :bigint :json :keyword= or fn) to one row                     |
+| =clear-cache! [d]= / =cache-size [d]= / =cached? [d sql]= | *sync* statement-cache maintenance and inspection                                                        |
+| =wrap-error [e sql]=                               | *pure* driver error ⇒ =sqlite-error= / =argument-error= (with =:reason=); library errors pass through            |
+| =default-cache-size= =max-params= =max-safe-integer= | constants: 128, 32766, 2^53−1                                                                                  |
+| =journal-modes= =synchronous-modes= =transaction-modes= | the accepted keyword sets                                                                                   |
+| =pragma* prepare* reader?* run* all* get* columns* exec* transaction* sqlite-version*= | synchronous internals (not part of the promise API)                    |
+
+** =sqlite-cljs.query=
+
+| fn                                                 | what                                                                                                            |
+|----------------------------------------------------+-----------------------------------------------------------------------------------------------------------------|
+| =->statement [q]= / =[q opts]=                      | *pure* designator (string / =[sql & params]= / ={:sql :params}= / DSL map) ⇒ ={:sql :params}=                     |
+| =query-all! [d q]= / =[d q opts]=                   | vector of kebab row maps; opts =:coerce :safe-integers? :in-json-threshold :max-params :sqlite-version=           |
+| =query-one! [d q]= / =[d q opts]=                   | first row or nil                                                                                                |
+| =query-value! [d q]= / =[d q opts]=                 | first column of the first row or nil                                                                            |
+| =execute! [d q]= / =[d q opts]=                     | ={:changes :last-insert-rowid}= or RETURNING rows; DSL inserts above =:max-params= chunked in one transaction      |
+| =execute-all! [d qs]= / =[d qs opts]=               | a vector of designators (DDL maps included) in one IMMEDIATE transaction unless one is active ⇒ vector of results |
+| =exec! [d sql-or-vec]=                             | parameter-less SQL string(s) / DDL map(s); clears the statement cache; ⇒ nil                                     |
+| =transact! [d f]= / =[d mode f]=                    | =:immediate= (default) / =:deferred= / =:exclusive=; synchronous body, rollback on throw, nested and async bodies rejected |
+| =clear-cache! [d]=                                 | drops the cached statements ⇒ nil                                                                               |
+
+** =sqlite-cljs.dsl= (all *pure*)
+
+| fn                                                 | what                                                                                                            |
+|----------------------------------------------------+-----------------------------------------------------------------------------------------------------------------|
+| =render [q]= / =[q opts]=                           | statement map ⇒ ={:sql :params}=; opts =:mode (:params / :literal) :in-json-threshold :max-params :sqlite-version= |
+| =render-chunked [q]= / =[q opts]=                   | bulk insert ⇒ vector of statements each within =:max-params=; other statements ⇒ one-element vector              |
+| =render-expr [e]= / =[e opts]=                      | expression ⇒ ={:sql :params}=                                                                                    |
+| =render-literal [e]=                               | expression ⇒ SQL string in DDL literal mode                                                                     |
+| =expr [e ctx]=                                     | the expression renderer with an explicit context (=default-opts= merged with options)                           |
+| =select-sql= / =insert-sql= / =update-sql= / =delete-sql [q ctx]= | per-statement renderers                                                                              |
+| =statement-kind [q]=                               | =:select :insert :update :delete= or nil                                                                        |
+| =type-names=                                       | ={:integer "INTEGER" :int "INT" :real "REAL" :text "TEXT" :blob "BLOB" :any "ANY" :numeric "NUMERIC"}=            |
+| =default-in-json-threshold= =default-max-params= =default-opts= | 500, 32766, the default render options                                                              |
+
+** =sqlite-cljs.ddl= (all *pure*)
+
+| fn                                                 | what                                                                                                            |
+|----------------------------------------------------+-----------------------------------------------------------------------------------------------------------------|
+| =render [d]= / =[d opts]=                           | definition map ⇒ ={:statements ["sql" …]}=; opts =:sqlite-version= for the alter gates                            |
+| =render-table-def [d]= / =[d opts]=                 | alias of =render=                                                                                               |
+| =create-table-sql [d]=                             | the =CREATE TABLE= statement only (no indexes)                                                                  |
+| =create-index-sql [d]= / =create-view-sql [d]= / =create-trigger-sql [d]= | one statement each                                                                       |
+| =alter-table-sql [d]= / =[d {:sqlite-version}]=     | one =ALTER TABLE= action, gated                                                                                 |
+| =drop-sql [d]=                                     | =DROP TABLE/INDEX/VIEW/TRIGGER [IF EXISTS]=                                                                      |
+| =column-sql [col]= / =[col ctx]=                    | one =[name type opts]= ⇒ fragment; ctx =:strict? :without-rowid? :add-column?=                                    |
+| =constraint-sql [c]=                               | one table constraint (vector or foreign-key map) ⇒ fragment                                                     |
+| =type-sql [t strict? col]=                         | type keyword / =[:raw …]= ⇒ SQL type name, STRICT-validated                                                      |
+| =def-kind [d]= / =def-name [d]=                     | =:create-table … :drop-trigger= or nil / the object name (derived for unnamed indexes)                           |
+| =expected-columns [d]=                             | =[{:name "snake" :type "INTEGER"} …]= a table def implies (what =migrate!= verifies)                              |
+| =strict-types= =all-types= =fk-actions= =conflict-clauses= =default-keywords= | vocabularies                                                                          |
+
+** =sqlite-cljs.migrate=
+
+| fn                                                 | what                                                                                                            |
+|----------------------------------------------------+-----------------------------------------------------------------------------------------------------------------|
+| =migrate! [d defs]= / =[d defs {:allow-newer? :log}]= | idempotent apply in one IMMEDIATE transaction ⇒ ={:created :existing :altered :dropped :user-version :previous-user-version :sqlite-version}=; rejects with =migration-error= |
+| =status! [d]=                                      | ={:user-version :schema-version :tables :views :indexes :triggers}=                                              |
+| =validate [defs]=                                  | *pure* ⇒ =[{:index :problem :error} …]= (empty when every def renders)                                            |
+| =object-type* [d name]= / =table-columns* [d table]= | synchronous introspection internals (=sqlite_master= type / =table_xinfo= rows)                               |
+
+** =sqlite-cljs.util= (all *pure*)
+
+| fn                                                 | what                                                                                                            |
+|----------------------------------------------------+-----------------------------------------------------------------------------------------------------------------|
+| =kebab->snake [k]= / =snake->kebab [k]=             | key case translation (namespaced keywords untouched by =snake->kebab=)                                           |
+| =transform-keys [f x]= / =[f passthrough x]=        | deep key transform with a pass-through key set                                                                  |
+| =ident-name [x]=                                   | unquoted SQL name of a keyword/symbol (kebab→snake) or exact string; empty / NUL ⇒ =argument-error=              |
+| =sql-ident [x]=                                    | one double-quoted identifier, embedded quotes doubled — never splits                                             |
+| =sql-qualified [x]=                                | qualified reference: =:u/name= ⇒ ="u"."name"=, dots split, trailing =*= bare; strings are one exact identifier      |
+| =sql-string-literal [s]=                           | single-quoted literal with ='= doubled (DDL literal mode only)                                                   |
+| =row->clj [o]= / =rows->clj [a]=                    | driver row object / array ⇒ kebab map / vector of maps                                                          |
+| =sqlite-error= / =argument-error= / =dsl-error= / =config-error= / =migration-error= | ex-info constructors                                                          |
+| =error-data [e]= / =error-type [e]= / =error-types= | structured data / =:type= of a library error (nil otherwise) / the set of types                                  |
+| =sqlite-code [e]= / =constraint-error? [e]= / =busy-error? [e]= | the =SQLITE_*= string / prefix predicates                                                             |
+| =version-vec [s]= / ~version>= [have need]~         | ="3.53.4"= ⇒ =[3 53 4]= / version comparison (nil =have= counts as satisfied)                                     |
