@@ -1,3 +1,15 @@
+node_modules/
+out/
+.cpcache/
+target/
+.shadow-cljs/
+.lsp/
+.clj-kondo/
+.nrepl-port
+.env
+.env.*
+*.log
+
 # Emacs
 *~
 #*#
