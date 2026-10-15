@@ -21,6 +21,7 @@ library renders into SQLite SQL, so that at call sites:
 It covers:
 
 - *One connection binding* — =sqlite-cljs.core= is the only namespace that touches the
+  driver: every line of better-sqlite3 interop in the library lives there.
   It opens the database with house pragmas (WAL, =foreign_keys= on, =busy_timeout=
   5000 ms, =trusted_schema= off), reports the values SQLite *actually* answered, binds
   values losslessly and maps every driver error to a structured =ex-info=.

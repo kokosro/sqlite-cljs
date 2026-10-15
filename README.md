@@ -3,10 +3,12 @@
 [SQLite](https://sqlite.org) from ClojureScript, with schemas and queries as data.
 
 `sqlite-cljs` is a client for SQLite on Node.js, built on the
+`better-sqlite3` driver. Schemas
 and queries are ClojureScript maps and vectors, and the library renders the SQL from
 them: every value becomes a bound parameter and every identifier is quoted, so no SQL is
 put together from strings. A schema is applied idempotently, rows come back as
 kebab-case keyword maps, and every operation returns a
+promise, settled already since the driver is synchronous. The database is a file or lives in
 memory; there is no server and no network. `better-sqlite3` is the only runtime npm
 dependency.
 
@@ -23,6 +25,7 @@ dependency.
 Open a database in memory, create a table, insert four rows, query them and update one.
 You need Node.js 22 or later and a JDK (for shadow-cljs).
 
+**1. Get the code.** `better-sqlite3` itself is an
 npm package that your project installs; it ships prebuilt binaries for the common
 platforms.
 
