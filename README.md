@@ -12,22 +12,27 @@ promise, settled already since the driver is synchronous. The database is a file
 memory; there is no server and no network. `better-sqlite3` is the only runtime npm
 dependency.
 
+- [Requirements](#requirements)
 - [Quick start](#quick-start)
-- [What to use it for](#what-to-use-it-for)
-- [Settings are yours](#settings-are-yours)
-- [Features](#features)
+- [Scenarios](#scenarios)
 - [Error handling](#error-handling)
-- [Reference](#reference)
+- [Features](#features)
+- [Limits and settings](#limits-and-settings)
+- [Documentation](#documentation)
+- [Layout](#layout)
 - [Development](#development)
+
+## Requirements
+
+You need Node.js 22 or later and a JDK (for shadow-cljs). `better-sqlite3` itself is an
+npm package that your project installs; it ships prebuilt binaries for the common
+platforms.
 
 ## Quick start
 
 Open a database in memory, create a table, insert four rows, query them and update one.
-You need Node.js 22 or later and a JDK (for shadow-cljs).
 
-**1. Get the code.** `better-sqlite3` itself is an
-npm package that your project installs; it ships prebuilt binaries for the common
-platforms.
+**1. Get the code.**
 
 ```sh
 
@@ -174,7 +179,7 @@ npm install
 npx shadow-cljs compile examples && node target/examples.js
 ```
 
-## What to use it for
+## Scenarios
 
 The examples work on the database of the quick start, with `schema` and the four users
 in it, and use these namespaces:
@@ -349,47 +354,70 @@ promises inside it are settled already and are read with `@`.
 {:id 5 :email "eve@example.com" :name "Eve Adams" :score 40}
 ```
 
-## Settings are yours
+## Error handling
 
-`sqlite/db` opens a connection with the settings below, which differ from what SQLite
-does when nothing is said. Each is an option of `sqlite/db`, and the connection reports
-what is in force under `:effective`:
+A function that returns a promise rejects and does not throw; `sqlite/db` and the pure
+renderers (`dsl/render`, `ddl/render`) throw. Either way the error is an `ex-info` whose
+`ex-data` carries a `:type`:
 
-```clojure
-(:effective db)
-;; => {:journal-mode "memory", :synchronous 2, :foreign-keys? true, :busy-timeout-ms 5000, :trusted-schema? false, :safe-integers? false}
-```
+| `:type` | Meaning |
+|---------|---------|
+| `:sqlite-cljs/sqlite-error` | SQLite raised it. `:code` is its extended result code as a string, `:sql` the statement |
+| `:sqlite-cljs/argument-error` | an argument or a value was refused before any SQL ran (`:reason`) |
+| `:sqlite-cljs/dsl-error` | a map that is not a statement the renderer takes (`:form`) |
+| `:sqlite-cljs/config-error` | the database could not be opened as asked (`:reason`) |
+| `:sqlite-cljs/migration-error` | a schema that cannot be applied (`:reason`) |
 
-| Option | Set | Absent |
-|--------|-----|--------|
-| `:foreign-keys?` | `false` leaves foreign keys unchecked, as SQLite does by itself | foreign keys are enforced |
-| `:timeout-ms` | how long a statement waits for a lock that another connection holds, in milliseconds; `0` does not wait | 5000 |
-| `:journal-mode` | `:delete` `:truncate` `:persist` `:memory` `:off` `:wal` | `:wal` for a file that is opened for writing; a database in memory has none |
-| `:require-journal-mode?` | `false` accepts the journal mode SQLite fell back to | a journal mode that could not be set is an error |
-| `:synchronous` | `:off` `:normal` `:full` `:extra` | not set: the value of the driver stays |
-| `:trusted-schema?` | `true` trusts the functions a schema calls | not trusted |
-| `:safe-integers?` | `true` reads every INTEGER as a BigInt | a number |
-| `:cache-size` | how many prepared statements a connection keeps | 128 |
+`util/error-data`, `util/error-type`, `util/sqlite-code`, `util/constraint-error?` and
+`util/busy-error?` read an error. An insert with every failure turned into data:
 
 ```clojure
-(sqlite/db {:path "app.db"
-            :journal-mode :delete
-            :synchronous :full
-            :timeout-ms 0
-            :foreign-keys? false})
+(defn explain
+  "What went wrong, as data."
+  [e]
+  (select-keys (util/error-data e) [:type :code :reason :message]))
+
+(defn add-user!
+  "Promise of {:id n} for the user inserted, or of {:failed data}. Never
+   rejects."
+  [db user]
+  (-> (q/execute! db {:insert-into :users :values [user]})
+      (p/then (fn [{:keys [last-insert-rowid]}] {:id last-insert-rowid}))
+      (p/catch (fn [e] {:failed (explain e)}))))
 ```
 
-Outside `sqlite/db` there are four more:
+```clojure
+(add-user! db {:email "eve@example.com" :name "Eve"})
+;; resolves to
+{:id 5}
 
-| Option | Where | Absent |
-|--------|-------|--------|
-| `:strict?` | a `:create-table` definition | `true`: the table is `STRICT` and refuses a value of another type than its column |
-| `:if-not-exists?` | a `:create-table`, `:create-index`, `:create-view` definition | `true` |
-| the mode | `(q/transact! db :deferred f)`, `:immediate`, `:exclusive` | `:immediate`: the write lock is taken when the transaction begins |
-| `:in-json-threshold` | a query | a list of more than 500 values in `[:in ...]` travels as one JSON parameter |
+(add-user! db {:email "ADA@example.com" :name "Ada again"})
+;; the email is taken: resolves to
+{:failed {:type :sqlite-cljs/sqlite-error
+          :code "SQLITE_CONSTRAINT_UNIQUE"
+          :message "UNIQUE constraint failed: users.email"}}
+```
 
-An insert of more rows than fit in one statement (SQLite takes 32766 parameters) is
-split into several statements inside one transaction.
+An order of a user who does not exist, a text in an integer column of a `STRICT` table,
+and an update that names no rows:
+
+```clojure
+(q/execute! db {:insert-into :orders :values [{:user-id 99 :amount 5 :placed-at 0}]})
+;; rejects with
+{:type :sqlite-cljs/sqlite-error
+ :code "SQLITE_CONSTRAINT_FOREIGNKEY"
+ :message "FOREIGN KEY constraint failed"}
+
+(q/execute! db {:update :users :set {:score "many"} :where [:= :name "Ada"]})
+;; rejects with
+{:type :sqlite-cljs/sqlite-error
+ :code "SQLITE_CONSTRAINT_DATATYPE"
+ :message "cannot store TEXT value in INTEGER column users.score"}
+
+(q/execute! db {:update :users :set {:score 0}})
+;; rejects before any SQL runs, with
+{:type :sqlite-cljs/dsl-error :form {:update :users :set {:score 0}}}
+```
 
 ## Features
 
@@ -489,72 +517,49 @@ The driver is synchronous: a statement runs to its end before the function retur
 the promise it returns is settled already. The promises keep the call sites as they are
 should a driver be asynchronous.
 
-## Error handling
+## Limits and settings
 
-A function that returns a promise rejects and does not throw; `sqlite/db` and the pure
-renderers (`dsl/render`, `ddl/render`) throw. Either way the error is an `ex-info` whose
-`ex-data` carries a `:type`:
-
-| `:type` | Meaning |
-|---------|---------|
-| `:sqlite-cljs/sqlite-error` | SQLite raised it. `:code` is its extended result code as a string, `:sql` the statement |
-| `:sqlite-cljs/argument-error` | an argument or a value was refused before any SQL ran (`:reason`) |
-| `:sqlite-cljs/dsl-error` | a map that is not a statement the renderer takes (`:form`) |
-| `:sqlite-cljs/config-error` | the database could not be opened as asked (`:reason`) |
-| `:sqlite-cljs/migration-error` | a schema that cannot be applied (`:reason`) |
-
-`util/error-data`, `util/error-type`, `util/sqlite-code`, `util/constraint-error?` and
-`util/busy-error?` read an error. An insert with every failure turned into data:
+`sqlite/db` opens a connection with the settings below, which differ from what SQLite
+does when nothing is said. Each is an option of `sqlite/db`, and the connection reports
+what is in force under `:effective`:
 
 ```clojure
-(defn explain
-  "What went wrong, as data."
-  [e]
-  (select-keys (util/error-data e) [:type :code :reason :message]))
-
-(defn add-user!
-  "Promise of {:id n} for the user inserted, or of {:failed data}. Never
-   rejects."
-  [db user]
-  (-> (q/execute! db {:insert-into :users :values [user]})
-      (p/then (fn [{:keys [last-insert-rowid]}] {:id last-insert-rowid}))
-      (p/catch (fn [e] {:failed (explain e)}))))
+(:effective db)
+;; => {:journal-mode "memory", :synchronous 2, :foreign-keys? true, :busy-timeout-ms 5000, :trusted-schema? false, :safe-integers? false}
 ```
+
+| Option | Set | Absent |
+|--------|-----|--------|
+| `:foreign-keys?` | `false` leaves foreign keys unchecked, as SQLite does by itself | foreign keys are enforced |
+| `:timeout-ms` | how long a statement waits for a lock that another connection holds, in milliseconds; `0` does not wait | 5000 |
+| `:journal-mode` | `:delete` `:truncate` `:persist` `:memory` `:off` `:wal` | `:wal` for a file that is opened for writing; a database in memory has none |
+| `:require-journal-mode?` | `false` accepts the journal mode SQLite fell back to | a journal mode that could not be set is an error |
+| `:synchronous` | `:off` `:normal` `:full` `:extra` | not set: the value of the driver stays |
+| `:trusted-schema?` | `true` trusts the functions a schema calls | not trusted |
+| `:safe-integers?` | `true` reads every INTEGER as a BigInt | a number |
+| `:cache-size` | how many prepared statements a connection keeps | 128 |
 
 ```clojure
-(add-user! db {:email "eve@example.com" :name "Eve"})
-;; resolves to
-{:id 5}
-
-(add-user! db {:email "ADA@example.com" :name "Ada again"})
-;; the email is taken: resolves to
-{:failed {:type :sqlite-cljs/sqlite-error
-          :code "SQLITE_CONSTRAINT_UNIQUE"
-          :message "UNIQUE constraint failed: users.email"}}
+(sqlite/db {:path "app.db"
+            :journal-mode :delete
+            :synchronous :full
+            :timeout-ms 0
+            :foreign-keys? false})
 ```
 
-An order of a user who does not exist, a text in an integer column of a `STRICT` table,
-and an update that names no rows:
+Outside `sqlite/db` there are four more:
 
-```clojure
-(q/execute! db {:insert-into :orders :values [{:user-id 99 :amount 5 :placed-at 0}]})
-;; rejects with
-{:type :sqlite-cljs/sqlite-error
- :code "SQLITE_CONSTRAINT_FOREIGNKEY"
- :message "FOREIGN KEY constraint failed"}
+| Option | Where | Absent |
+|--------|-------|--------|
+| `:strict?` | a `:create-table` definition | `true`: the table is `STRICT` and refuses a value of another type than its column |
+| `:if-not-exists?` | a `:create-table`, `:create-index`, `:create-view` definition | `true` |
+| the mode | `(q/transact! db :deferred f)`, `:immediate`, `:exclusive` | `:immediate`: the write lock is taken when the transaction begins |
+| `:in-json-threshold` | a query | a list of more than 500 values in `[:in ...]` travels as one JSON parameter |
 
-(q/execute! db {:update :users :set {:score "many"} :where [:= :name "Ada"]})
-;; rejects with
-{:type :sqlite-cljs/sqlite-error
- :code "SQLITE_CONSTRAINT_DATATYPE"
- :message "cannot store TEXT value in INTEGER column users.score"}
+An insert of more rows than fit in one statement (SQLite takes 32766 parameters) is
+split into several statements inside one transaction.
 
-(q/execute! db {:update :users :set {:score 0}})
-;; rejects before any SQL runs, with
-{:type :sqlite-cljs/dsl-error :form {:update :users :set {:score 0}}}
-```
-
-## Reference
+## Documentation
 
 - [`docs/sqlite-cljs.org`](docs/sqlite-cljs.org) is the manual: the db value and its
   pragmas, the DDL and the query DSL with every operator, `migrate!`, running queries,
@@ -563,9 +568,36 @@ and an update that names no rows:
 - [`docs/sqlite-api-inventory.org`](docs/sqlite-api-inventory.org) maps the grammar of
   SQLite and the API of the driver to the data the library takes.
 
+## Layout
+
 Every public function carries a docstring; the namespaces are `sqlite-cljs.core`,
 `sqlite-cljs.query`, `sqlite-cljs.dsl`, `sqlite-cljs.ddl`, `sqlite-cljs.migrate` and
 `sqlite-cljs.util`.
+
+```
+src/sqlite_cljs/
+  core.cljs      the driver binding: db and close!, pragmas, value binding, the statement cache, error mapping
+  query.cljs     running statements over core: the query designators, rows and change counts, transact!
+  migrate.cljs   migrate!, status! and validate over core and ddl
+  dsl.cljs       the query renderer: a statement map to {:sql :params} (pure)
+  ddl.cljs       the schema renderer: a definition map to CREATE statements, STRICT validation (pure)
+  util.cljs      kebab/snake translation, identifier quoting, row conversion, error constructors, version compare (pure)
+dev/sqlite_cljs/
+  examples.cljs   the examples of this README
+  smoke.cljs      the smoke: a database file in a temp directory beside one in memory
+  dev.cljs        the entry point of the REPL build
+dev/
+  probe-bs3.js, probe-edge.js   probes of the driver, run by hand with node
+test/sqlite_cljs/
+  util_test.cljs, dsl_test.cljs, ddl_test.cljs, core_test.cljs, query_test.cljs, migrate_test.cljs   the suite, one per namespace
+  examples_test.cljs   the examples of this README, run: it holds the README to the code
+  test_util.cljc       helpers: a test over a promise, settled already since the driver is synchronous
+  doctest.clj          macros of the examples test
+test/publicity_gate.sh   the documentation gate that run-tests.sh runs first
+docs/
+  sqlite-cljs.org            the manual
+  sqlite-api-inventory.org   the API inventory
+```
 
 ## Development
 
