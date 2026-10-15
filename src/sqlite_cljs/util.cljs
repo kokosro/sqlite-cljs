@@ -55,6 +55,7 @@
    rendered kebab->snake (namespace dropped), strings are exact. Throws
    :sqlite-cljs/argument-error for anything else, for the empty string and
    for names containing a NUL character (an embedded NUL would truncate the
+   SQL text)."
   [x]
   (let [s (cond
             (or (keyword? x) (symbol? x)) (kebab->snake x)
