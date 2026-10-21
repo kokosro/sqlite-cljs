@@ -1,5 +1,5 @@
 (ns sqlite-cljs.smoke
-  "Phase 4 LIVE smoke: the whole library against a REAL file database in a
+  "LIVE smoke: the whole library against a REAL file database in a
    fresh temporary directory (os.tmpdir + mkdtemp, removed at the end) with
    an in-memory database opened side by side. No network anywhere; not
    part of run-tests.sh.

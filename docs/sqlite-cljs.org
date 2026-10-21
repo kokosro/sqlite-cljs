@@ -78,7 +78,7 @@ its synchronous internals with a =*= suffix (=run*=, =all*=, =pragma*=, =transac
 for =query= and =migrate=; they are not part of the promise API and are listed in the
 [[API reference]] for completeness only.
 
-Where this manual says "verified live" it refers to the phase-4 live smoke of 2026-09-25
+Where this manual says "verified live" it refers to the live smoke of 2026-09-25
 (=dev/sqlite_cljs/smoke.cljs=: a real file database in a fresh temporary directory plus a
 =:memory:= database side by side, 11 sections all passing — versions and effective
 pragmas, =migrate!= and its idempotent re-run, DSL inserts / upsert RETURNING / joins,
@@ -1188,12 +1188,12 @@ npx shadow-cljs compile smoke && node target/smoke.js   # LIVE smoke: real file 
 - =shadow-cljs.edn= is standalone (declares =funcool/promesa= itself) so =npx shadow-cljs …=
   only needs Java and =node_modules=; =deps.edn= mirrors the dependencies for consumers.
   Builds: =:node-test=, =:dev=, =:smoke=.
-- Probe scripts from phase 1 (=dev/probe-bs3.js=, =dev/probe-edge.js=) are the raw
-  driver experiments behind the inventory's =[LOCAL]= tags; they are not part of any build.
+- Probe scripts (=dev/probe-bs3.js=, =dev/probe-edge.js=) are the raw
+  driver experiments behind the inventory's =(local)= citations; they are not part of any build.
 
 ** The live smoke
 
-=dev/sqlite_cljs/smoke.cljs= is the phase-4 live verification: the whole library against a
+=dev/sqlite_cljs/smoke.cljs= is the live verification: the whole library against a
 real file database created with =mkdtemp= under the OS temp directory (=db.sqlite=, removed
 at the end together with its WAL files) plus a =:memory:= database opened side by side.
 There is no network anywhere. Sections run in order and never abort early: each prints

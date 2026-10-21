@@ -23,5 +23,10 @@ fi
 
 bash test/publicity_gate.sh
 
+# Use the Homebrew JDK when available and JAVA_HOME is not already set.
+if [ -z "${JAVA_HOME:-}" ]; then
+  [ -d /opt/homebrew/opt/openjdk ] && export JAVA_HOME=/opt/homebrew/opt/openjdk
+fi
+
 npx shadow-cljs compile node-test --config-merge '{:autorun false}'
 exec node target/node-test.js

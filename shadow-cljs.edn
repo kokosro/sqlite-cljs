@@ -24,7 +24,7 @@
         :output-to "target/dev.js"
         :devtools {:enabled true}}
 
-  ;; Phase 4 LIVE smoke: the library against a real file database in a fresh
+  ;; LIVE smoke: the library against a real file database in a fresh
   ;; temp directory (removed afterwards) plus a :memory: database; no network.
   ;;   npx shadow-cljs compile smoke && node target/smoke.js
   :smoke {:target :node-script

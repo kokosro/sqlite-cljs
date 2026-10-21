@@ -85,7 +85,7 @@ tryp("delete limit (ENABLE_UPDATE_DELETE_LIMIT)", () => db.prepare("delete from 
 tryp("close", () => db.close() === db);
 tryp("open after close", () => db.open);
 tryp("prepare after close", () => db.prepare("select 1"));
-const p = "/home/borret/.claude/jobs/f752c482/tmp/probe13.db";
+const p = require("path").join(require("os").tmpdir(), "probe13.db");
 try { require("fs").unlinkSync(p); } catch {}
 const fdb = new Database(p);
 tryp("file journal_mode default", () => fdb.pragma("journal_mode", {simple:true}));
@@ -97,7 +97,7 @@ fdb.close();
 tryp("timeout option -> busy_timeout", () => { const d = new Database(p, {timeout: 1234}); const r = d.pragma("busy_timeout", {simple:true}); d.close(); return r; });
 tryp("two connections, writer lock busy", () => { const a = new Database(p, {timeout: 50}); const b = new Database(p, {timeout: 50}); a.exec("create table if not exists w(x)"); a.exec("begin immediate"); try { b.exec("begin immediate"); return "no busy?"; } catch (e) { return e.constructor.name + " " + e.code + " " + e.message; } finally { a.exec("rollback"); a.close(); b.close(); } });
 tryp("open nonexistent dir", () => new Database("/nonexistent/dir/x.db"));
-tryp("fileMustExist", () => new Database("/home/borret/.claude/jobs/f752c482/tmp/none.db", {fileMustExist:true}));
+tryp("fileMustExist", () => new Database(require("path").join(require("os").tmpdir(), "none.db"), {fileMustExist:true}));
 tryp("readonly write", () => { const d = new Database(p, {readonly:true}); try { return d.exec("create table ro(x)"); } finally { d.close(); } });
 tryp("SqliteError export", () => typeof Database.SqliteError);
 tryp("Database.prototype keys", () => Object.getOwnPropertyNames(Database.prototype));
